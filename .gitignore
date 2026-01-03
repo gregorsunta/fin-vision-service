@@ -1,0 +1,38 @@
+# Dependencies
+/node_modules
+/.pnpm-store
+
+# Build artifacts
+/dist
+
+# Logs
+logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-error.log
+lerna-debug.log
+
+# Environment variables
+.env
+.env*.local
+gcp-credentials.json
+
+# Drizzle
+/drizzle
+
+# IDEs and editors
+.idea
+.vscode
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Uploads
+/uploads/

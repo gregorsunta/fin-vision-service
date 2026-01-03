@@ -1,0 +1,27 @@
+# docker-compose.prod.yml
+# ------------------------------------
+# This file provides override configurations for PRODUCTION.
+#
+# USAGE:
+# 1. Edit the host paths (e.g., '/srv/fin-vision-data/mysql') to your desired locations.
+# 2. Ensure the directories on the host exist and have the correct permissions.
+# 3. Deploy using: docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+version: '3.9'
+
+services:
+  api:
+    volumes:
+      # Mounts a specific host directory for file uploads.
+      - /srv/fin-vision-data/uploads:/app/uploads
+
+  mysql:
+    volumes:
+      # Mounts a specific host directory into the container.
+      # The host path '/srv/fin-vision-data/mysql' is an example; change it to your preference.
+      - /srv/fin-vision-data/mysql:/var/lib/mysql
+  
+  redis:
+    volumes:
+      # Mounts a specific host directory for Redis data.
+      - /srv/fin-vision-data/redis:/data
