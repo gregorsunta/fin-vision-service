@@ -1,19 +1,22 @@
 import 'dotenv/config';
 import Fastify from 'fastify';
 import multipart from '@fastify/multipart';
-import receiptRoutes from './routes/receipts';
-import userRoutes from './routes/users';
-import fileRoutes from './routes/files';
-const server = Fastify({
-    logger: {
-        transport: {
-            target: 'pino-pretty',
-            options: {
-                translateTime: 'HH:MM:ss Z',
-                ignore: 'pid,hostname',
-            },
+import receiptRoutes from './routes/receipts.js';
+import userRoutes from './routes/users.js';
+import fileRoutes from './routes/files.js';
+import imageProcessingRoutes from './routes/image-processing.js';
+// Set up a conditional logger. Use pino-pretty in development, default JSON in production.
+const loggerConfig = process.env.NODE_ENV === 'development' ? {
+    transport: {
+        target: 'pino-pretty',
+        options: {
+            translateTime: 'HH:MM:ss Z',
+            ignore: 'pid,hostname',
         },
     },
+} : true;
+const server = Fastify({
+    logger: loggerConfig,
 });
 async function main() {
     // Register plugins
@@ -26,6 +29,7 @@ async function main() {
     server.register(userRoutes, { prefix: '/api' });
     server.register(receiptRoutes, { prefix: '/api' });
     server.register(fileRoutes, { prefix: '/api' });
+    server.register(imageProcessingRoutes, { prefix: '/api' });
     // Start the server
     try {
         const port = process.env.API_PORT ? parseInt(process.env.API_PORT, 10) : 3000;

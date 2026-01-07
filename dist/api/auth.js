@@ -1,4 +1,4 @@
-import { db, users } from '../db';
+import { db, users } from '../db/index.js';
 import { eq } from 'drizzle-orm';
 /**
  * A Fastify hook to protect routes. It checks for a valid user API key

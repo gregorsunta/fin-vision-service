@@ -4,6 +4,7 @@ import multipart from '@fastify/multipart';
 import receiptRoutes from './routes/receipts.js';
 import userRoutes from './routes/users.js';
 import fileRoutes from './routes/files.js';
+import imageProcessingRoutes from './routes/image-processing.js';
 
 // Set up a conditional logger. Use pino-pretty in development, default JSON in production.
 const loggerConfig = process.env.NODE_ENV === 'development' ? {
@@ -33,6 +34,7 @@ async function main() {
   server.register(userRoutes, { prefix: '/api' });
   server.register(receiptRoutes, { prefix: '/api' });
   server.register(fileRoutes, { prefix: '/api' });
+  server.register(imageProcessingRoutes, { prefix: '/api' });
 
   // Start the server
   try {

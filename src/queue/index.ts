@@ -6,7 +6,7 @@ if (!process.env.REDIS_HOST || !process.env.REDIS_PORT) {
 }
 
 export const redisConnection: ConnectionOptions = {
-    host: process.env.REDIS_HOST || 'localhost',
+    host: process.env.NODE_ENV === 'development' ? 'localhost' : process.env.REDIS_HOST || 'localhost',
     port: process.env.REDIS_PORT ? parseInt(process.env.REDIS_PORT, 10) : 6379,
 };
 

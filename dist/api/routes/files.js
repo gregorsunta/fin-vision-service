@@ -1,8 +1,12 @@
-import { authenticate } from '../auth';
-import { db, receipts } from '../../db';
+import { authenticate } from '../auth.js';
+import { db, receipts } from '../../db/index.js';
 import { eq } from 'drizzle-orm';
 import path from 'path';
 import fs from 'fs';
+import { fileURLToPath } from 'url';
+// Replicate __dirname functionality in ES Modules
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 export default async function fileRoutes(server) {
     server.get('/files/:filename', { preHandler: [authenticate] }, async (request, reply) => {
         const { filename } = request.params;

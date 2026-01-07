@@ -1,8 +1,27 @@
-import { db, receipts, lineItems } from '../db';
+import { db, receipts, lineItems } from '../db/index.js';
 import { eq } from 'drizzle-orm';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { ImageAnnotatorClient } from '@google-cloud/vision';
-import { PromptManager } from '../services/PromptManager';
+import { PromptManager } from '../services/PromptManager.js';
+import * as fs from 'fs';
+import * as path from 'path';
+import { fileURLToPath } from 'url';
+// Replicate __dirname functionality in ES Modules
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+// Define log directory and file path
+const LOG_DIR = path.join(__dirname, '../../logs');
+const VISION_ERROR_LOG_FILE = path.join(LOG_DIR, 'vision-error.log');
+// Helper function to log Vision API errors to a file
+async function logVisionError(error, receiptId) {
+    if (!fs.existsSync(LOG_DIR)) {
+        fs.mkdirSync(LOG_DIR, { recursive: true });
+    }
+    const timestamp = new Date().toISOString();
+    const errorMessage = `[${timestamp}] Receipt ID: ${receiptId}\nError: ${error.message}\nStack: ${error.stack}\nDetails: ${JSON.stringify(error.details || error.metadata || {}, null, 2)}\n\n`;
+    fs.appendFileSync(VISION_ERROR_LOG_FILE, errorMessage);
+    console.error(`Vision API error for receipt ${receiptId} logged to ${VISION_ERROR_LOG_FILE}`);
+}
 // Initialize Google Cloud clients
 const visionClient = new ImageAnnotatorClient();
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
@@ -12,7 +31,7 @@ const promptManager = new PromptManager();
  * @param imageUrl The relative path of the image (e.g., /files/filename.jpg).
  * @returns The detected text from the image.
  */
-async function runOcrOnImage(imageUrl) {
+async function runOcrOnImage(imageUrl, receiptId) {
     const apiEndpoint = `http://api:3000/api${imageUrl}`;
     console.log(`Fetching image for OCR from: ${apiEndpoint}`);
     let imageBuffer;
@@ -33,8 +52,16 @@ async function runOcrOnImage(imageUrl) {
         throw new Error('Could not fetch image file for processing.');
     }
     console.log('Successfully fetched image. Running Google Cloud Vision OCR...');
-    const [result] = await visionClient.textDetection(imageBuffer);
-    const detections = result.textAnnotations;
+    let detections;
+    try {
+        const [result] = await visionClient.textDetection(imageBuffer);
+        detections = result.textAnnotations;
+    }
+    catch (error) {
+        // Log the detailed Vision API error to a file
+        await logVisionError(error, receiptId);
+        throw new Error(`Vision API Text Detection failed for receipt ${receiptId}: ${error.message}`);
+    }
     if (!detections || detections.length === 0 || !detections[0].description) {
         throw new Error('No text found in image by Google Cloud Vision.');
     }
@@ -49,7 +76,7 @@ async function runOcrOnImage(imageUrl) {
 async function getExtractedDataFromGemini(ocrText) {
     console.log('Extracting structured data with Gemini...');
     const model = genAI.getGenerativeModel({
-        model: 'gemini-1.5-flash-lite',
+        model: 'gemini-2.5-flash',
         tools: [promptManager.getExtractionTool()], // Wrap the tool in an array
         generationConfig: promptManager.getGenerationConfig(),
         safetySettings: promptManager.getSafetySettings(),
@@ -69,7 +96,7 @@ export default async function (job) {
     console.log(`Processing job ${job.id} for receiptId: ${receiptId}`);
     try {
         // 1. Get OCR text from the image
-        const ocrText = await runOcrOnImage(imageUrl);
+        const ocrText = await runOcrOnImage(imageUrl, receiptId);
         // 2. Extract structured data using Gemini
         const extractedData = await getExtractedDataFromGemini(ocrText);
         if (!extractedData || !extractedData.line_items) {

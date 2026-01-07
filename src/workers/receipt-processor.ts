@@ -102,7 +102,7 @@ async function getExtractedDataFromGemini(ocrText: string): Promise<IExtractedDa
   console.log('Extracting structured data with Gemini...');
 
   const model = genAI.getGenerativeModel({
-    model: 'gemini-2.5-flash',
+    model: 'gemini-3-flash-preview',
     tools: [promptManager.getExtractionTool()], // Wrap the tool in an array
     generationConfig: promptManager.getGenerationConfig(),
     safetySettings: promptManager.getSafetySettings(),

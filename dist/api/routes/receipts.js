@@ -1,11 +1,15 @@
-import { db, receipts } from '../../db';
-import { receiptQueue } from '../../queue';
+import { db, receipts } from '../../db/index.js';
+import { receiptQueue } from '../../queue/index.js';
 import { pipeline } from 'stream';
 import { promisify } from 'util';
 import fs from 'fs';
 import path from 'path';
 import { randomBytes } from 'crypto';
-import { authenticate } from '../auth';
+import { authenticate } from '../auth.js';
+import { fileURLToPath } from 'url';
+// Replicate __dirname functionality in ES Modules
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 const pump = promisify(pipeline);
 export default async function receiptRoutes(server) {
     server.post('/receipts', { preHandler: [authenticate] }, async (request, reply) => {

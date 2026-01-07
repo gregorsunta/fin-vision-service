@@ -1,8 +1,11 @@
 import 'dotenv/config';
 import { migrate } from 'drizzle-orm/mysql2/migrator';
-import { db } from './index';
-import { poolConnection } from './index';
+import { db, poolConnection } from './index.js';
 import path from 'path';
+import { fileURLToPath } from 'url';
+// Replicate __dirname functionality in ES Modules
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 async function runMigrations() {
     console.log('Running database migrations...');
     const migrationsFolder = path.join(__dirname, '../../drizzle');

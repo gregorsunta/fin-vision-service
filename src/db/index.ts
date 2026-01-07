@@ -7,7 +7,14 @@ if (!process.env.DATABASE_URL) {
   throw new Error('DATABASE_URL is not set in the environment variables');
 }
 
-export const poolConnection = mysql.createPool(process.env.DATABASE_URL);
+let connectionString = process.env.DATABASE_URL;
+if (process.env.NODE_ENV === 'development') {
+  // In development, replace the Docker service hostname with localhost
+  connectionString = connectionString.replace('@mysql:', '@localhost:');
+}
+
+export const poolConnection = mysql.createPool(connectionString);
 
 export const db = drizzle(poolConnection, { schema, mode: 'default' });
+
 export * from './schema.js';

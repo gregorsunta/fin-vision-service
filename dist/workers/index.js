@@ -1,6 +1,10 @@
 import { Worker } from 'bullmq';
-import { redisConnection, RECEIPT_PROCESSING_QUEUE } from '../queue';
+import { redisConnection, RECEIPT_PROCESSING_QUEUE } from '../queue/index.js';
 import path from 'path';
+import { fileURLToPath } from 'url';
+// Replicate __dirname functionality in ES Modules
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 console.log('Worker process started...');
 const worker = new Worker(RECEIPT_PROCESSING_QUEUE, path.join(__dirname, 'receipt-processor.js'), // Use the compiled JS file
 {
