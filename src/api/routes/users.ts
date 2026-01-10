@@ -1,8 +1,12 @@
 import { FastifyInstance } from 'fastify';
-import { db, users } from '../../db/index.js';
+import { db, users, receiptUploads, receipts } from '../../db/index.js';
 import { randomBytes } from 'crypto';
 import { authenticate } from '../auth.js';
 import { generateReceiptsCsv } from '../../services/csvGenerator.js';
+import { eq, inArray } from 'drizzle-orm';
+
+// Define a placeholder type that matches what generateReceiptsCsv expects.
+type Receipt = any;
 
 export default async function userRoutes(
   server: FastifyInstance,
@@ -37,21 +41,29 @@ export default async function userRoutes(
     }
 
     try {
-      // Fetch all receipts for the authenticated user with their line items
-      const userReceipts = await db.query.receipts.findMany({
-        where: (receipts, { eq }) => eq(receipts.userId, request.user!.id),
+      // Step 1: Find all upload IDs for the current user
+      const userUploads = await db.select({ id: receiptUploads.id }).from(receiptUploads).where(eq(receiptUploads.userId, request.user.id));
+      
+      if (userUploads.length === 0) {
+        return reply.status(404).send({ message: 'No receipt uploads found for this user.' });
+      }
+
+      const uploadIds = userUploads.map(u => u.id);
+
+      // Step 2: Fetch all receipts associated with those upload IDs, along with their line items
+      const userReceipts: Receipt[] = await db.query.receipts.findMany({
+        where: inArray(receipts.uploadId, uploadIds),
         with: {
           lineItems: true,
         },
       });
 
       if (!userReceipts || userReceipts.length === 0) {
-        return reply.status(404).send({ message: 'No receipts found for this user.' });
+        return reply.status(404).send({ message: 'No processed receipts found for this user.' });
       }
 
       // Generate CSV from the fetched data
-      // Placeholder: Implement generateReceiptsCsv in a separate service/utility
-      const csv = generateReceiptsCsv(userReceipts); // This function will be created next
+      const csv = generateReceiptsCsv(userReceipts);
 
       reply.header('Content-Type', 'text/csv');
       reply.header('Content-Disposition', `attachment; filename="user_${request.user.id}_receipts_export.csv"`);
