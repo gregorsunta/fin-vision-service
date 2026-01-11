@@ -62,20 +62,24 @@ export class ImageSplitterService {
 
       for (const box of detectedBoundingBoxes) {
         // Convert 1000x1000 grid coordinates to actual pixel coordinates
-        const normalizedX = box.x / 1000;
-        const normalizedY = box.y / 1000;
-        const normalizedWidth = box.width / 1000;
-        const normalizedHeight = box.height / 1000;
+        const pixelX = Math.round((box.x / 1000) * imageWidth);
+        const pixelY = Math.round((box.y / 1000) * imageHeight);
+        const pixelWidth = Math.round((box.width / 1000) * imageWidth);
+        const pixelHeight = Math.round((box.height / 1000) * imageHeight);
 
-        const pixelX = Math.round(normalizedX * imageWidth);
-        const pixelY = Math.round(normalizedY * imageHeight);
-        const pixelWidth = Math.round(normalizedWidth * imageWidth);
-        const pixelHeight = Math.round(normalizedHeight * imageHeight);
+        // Add 2.5% padding to each side as a safety margin
+        const paddingWidth = Math.round(pixelWidth * 0.025);
+        const paddingHeight = Math.round(pixelHeight * 0.025);
 
-        const left = Math.max(0, pixelX);
-        const top = Math.max(0, pixelY);
-        const width = pixelWidth;
-        const height = pixelHeight;
+        const paddedX = pixelX - paddingWidth;
+        const paddedY = pixelY - paddingHeight;
+        const paddedWidth = pixelWidth + (paddingWidth * 2);
+        const paddedHeight = pixelHeight + (paddingHeight * 2);
+
+        const left = Math.max(0, paddedX);
+        const top = Math.max(0, paddedY);
+        const width = paddedWidth;
+        const height = paddedHeight;
 
         if (left >= imageWidth || top >= imageHeight) {
           console.warn('Skipping bounding box starting outside of image bounds (after conversion):', box);
@@ -123,7 +127,8 @@ export class ImageSplitterService {
         {"x": int, "y": int, "width": int, "height": int},
         {"x": int, "y": int, "width": int, "height": int}
       ]
-      These coordinates (x, y, width, height) should be relative to a 1000x1000 grid where [0,0] is the top-left and [1000,1000] is the bottom-right of the original image. Ensure that the coordinates represent the tightest possible rectangle around each receipt.
+      These coordinates (x, y, width, height) should be relative to a 1000x1000 grid where [0,0] is the top-left and [1000,1000] is the bottom-right. 
+      It is critical that you are generous with the bounding boxes. Ensure the coordinates encapsulate the *entire* paper receipt, even if it means including a small margin of the background. Do not cut off any part of the receipt.
       Do not include any other text or explanation in your response, only the JSON array.
     `;
 

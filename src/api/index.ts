@@ -23,7 +23,11 @@ const server = Fastify({
 
 async function main() {
   // Register plugins
-  server.register(multipart);
+  server.register(multipart, {
+    limits: {
+      fileSize: 10 * 1024 * 1024, // 10 MB limit
+    },
+  });
 
   // Register health check
   server.get('/health', async (_, __) => {
