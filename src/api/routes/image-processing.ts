@@ -29,12 +29,7 @@ async function saveFile(buffer: Buffer, originalFilename: string): Promise<{ fil
 }
 
 export default async function imageProcessingRoutes(server: FastifyInstance) {
-  // This endpoint is now a legacy endpoint, the main logic is in /split-and-analyze
-  server.post('/image/split', { preHandler: [authenticate] }, async (_request, reply) => {
-    return reply.status(400).send({
-      error: 'This endpoint is deprecated. Please use /api/image/split-and-analyze for full processing.',
-    });
-  });
+
 
   server.post('/image/split-and-analyze', { preHandler: [authenticate] }, async (request, reply) => {
     if (!request.user) {
