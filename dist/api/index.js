@@ -1,7 +1,6 @@
 import 'dotenv/config';
 import Fastify from 'fastify';
 import multipart from '@fastify/multipart';
-import receiptRoutes from './routes/receipts.js';
 import userRoutes from './routes/users.js';
 import fileRoutes from './routes/files.js';
 import imageProcessingRoutes from './routes/image-processing.js';
@@ -20,14 +19,17 @@ const server = Fastify({
 });
 async function main() {
     // Register plugins
-    server.register(multipart);
+    server.register(multipart, {
+        limits: {
+            fileSize: 10 * 1024 * 1024, // 10 MB limit
+        },
+    });
     // Register health check
     server.get('/health', async (_, __) => {
         return { status: 'ok' };
     });
     // Register routes
     server.register(userRoutes, { prefix: '/api' });
-    server.register(receiptRoutes, { prefix: '/api' });
     server.register(fileRoutes, { prefix: '/api' });
     server.register(imageProcessingRoutes, { prefix: '/api' });
     // Start the server

@@ -1,5 +1,5 @@
 import { authenticate } from '../auth.js';
-import { db, receipts } from '../../db/index.js';
+import { db, receipts, receiptUploads } from '../../db/index.js';
 import { eq } from 'drizzle-orm';
 import path from 'path';
 import fs from 'fs';
@@ -12,19 +12,36 @@ export default async function fileRoutes(server) {
         const { filename } = request.params;
         const publicImageUrl = `/files/${filename}`;
         try {
-            // Find the receipt associated with this file
+            // Find the receipt associated with this file, and its parent upload
             const receipt = await db.query.receipts.findFirst({
                 where: eq(receipts.imageUrl, publicImageUrl),
-                columns: { id: true, userId: true },
+                with: {
+                    upload: {
+                        columns: {
+                            userId: true
+                        }
+                    }
+                }
             });
-            if (!receipt) {
-                return reply.status(404).send({ error: 'File not found.' });
+            if (!receipt || !receipt.upload) {
+                // Also check if it's an original or marked image from the uploads table
+                const upload = await db.query.receiptUploads.findFirst({
+                    where: eq(receiptUploads.originalImageUrl, publicImageUrl) || eq(receiptUploads.markedImageUrl, publicImageUrl),
+                    columns: { userId: true },
+                });
+                if (!upload) {
+                    return reply.status(404).send({ error: 'File not found.' });
+                }
+                // Authorize for upload images
+                if (request.user?.id !== upload.userId && !request.isInternal) {
+                    return reply.status(403).send({ error: 'Forbidden.' });
+                }
             }
-            // Authorize: Check for internal access or user ownership
-            const isOwner = request.user && request.user.id === receipt.userId;
-            const isInternal = request.isInternal;
-            if (!isOwner && !isInternal) {
-                return reply.status(403).send({ error: 'Forbidden.' });
+            else {
+                // Authorize for receipt images
+                if (request.user?.id !== receipt.upload.userId && !request.isInternal) {
+                    return reply.status(403).send({ error: 'Forbidden.' });
+                }
             }
             // Authorized, now stream the file
             const filePath = path.join(__dirname, '../../../uploads', filename);

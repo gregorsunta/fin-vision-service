@@ -53,6 +53,7 @@ export default async function imageProcessingRoutes(server: FastifyInstance) {
     const insertResult = await db.insert(receiptUploads).values({
       userId: request.user.id,
       originalImageUrl,
+      updatedAt: new Date(),
     });
     const uploadJobId = insertResult[0].insertId;
     const [uploadJob] = await db.select().from(receiptUploads).where(eq(receiptUploads.id, uploadJobId));
@@ -110,7 +111,6 @@ export default async function imageProcessingRoutes(server: FastifyInstance) {
           imageUrl: receiptImageUrl,
         });
         const receiptRecordId = receiptInsertResult[0].insertId;
-        const [receiptRecord] = await db.select().from(receipts).where(eq(receipts.id, receiptRecordId));
 
         try {
           // Call analysis service for this single receipt
@@ -131,13 +131,13 @@ export default async function imageProcessingRoutes(server: FastifyInstance) {
               transactionDate: new Date(extractedData.transactionDate),
               keywords: extractedData.keywords,
             })
-            .where(eq(receipts.id, receiptRecord.id));
+            .where(eq(receipts.id, receiptRecordId));
 
           // Insert line items
           if (extractedData.items && extractedData.items.length > 0) {
             await db.insert(lineItems).values(
               extractedData.items.map(item => ({
-                receiptId: receiptRecord.id,
+                receiptId: receiptRecordId,
                 description: item.description,
                 quantity: item.quantity.toString(),
                 unitPrice: item.price.toString(),
@@ -145,19 +145,19 @@ export default async function imageProcessingRoutes(server: FastifyInstance) {
               }))
             );
           }
-          successfulReceipts.push({ receiptId: receiptRecord.id, imageUrl: receiptImageUrl, data: extractedData });
+          successfulReceipts.push({ receiptId: receiptRecordId, imageUrl: receiptImageUrl, data: extractedData });
         } catch (err: any) {
           allSucceeded = false;
           const errorMessage = err.message || 'An unknown error occurred during analysis.';
           // Update DB
-          await db.update(receipts).set({ status: 'failed' }).where(eq(receipts.id, receiptRecord.id));
+          await db.update(receipts).set({ status: 'failed' }).where(eq(receipts.id, receiptRecordId));
           await db.insert(processingErrors).values({
             uploadId: uploadJob.id,
-            receiptId: receiptRecord.id,
+            receiptId: receiptRecordId,
             category: 'EXTRACTION_FAILURE',
             message: errorMessage,
           });
-          failedReceipts.push({ receiptId: receiptRecord.id, imageUrl: receiptImageUrl, error: errorMessage });
+          failedReceipts.push({ receiptId: receiptRecordId, imageUrl: receiptImageUrl, error: errorMessage });
         }
       }
 
