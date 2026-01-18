@@ -36,3 +36,6 @@ Thumbs.db
 
 # Uploads
 /uploads/
+
+# Other
+cookie-jar.txt
