@@ -17,6 +17,13 @@ RUN npm install
 COPY . .
 RUN npm run build
 
+# ---- Development ----
+# Image for local development with all dependencies and source code
+FROM base AS development
+ENV NODE_ENV=development
+RUN npm install
+COPY . .
+
 # ---- Production ----
 # Final, lightweight image
 FROM base AS production

@@ -16,7 +16,11 @@ import {
 // --- Users Table (unchanged) ---
 export const users = mysqlTable('users', {
   id: serial('id').primaryKey(),
-  apiKey: varchar('api_key', { length: 255 }).notNull().unique(),
+  email: varchar('email', { length: 255 }).notNull().unique(),
+  // NOTE: In a real production environment, this should be a securely hashed password.
+  password: text('password').notNull(),
+  apiKey: varchar('api_key', { length: 255 }).unique(),
+  refreshToken: text('refresh_token'),
 });
 
 // --- New Tables ---

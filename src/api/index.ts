@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import Fastify from 'fastify';
 import multipart from '@fastify/multipart';
+import cookie from '@fastify/cookie';
 import userRoutes from './routes/users.js';
 import fileRoutes from './routes/files.js';
 import imageProcessingRoutes from './routes/image-processing.js';
@@ -27,6 +28,7 @@ async function main() {
       fileSize: 10 * 1024 * 1024, // 10 MB limit
     },
   });
+  server.register(cookie);
 
   // Register health check
   server.get('/health', async (_, __) => {

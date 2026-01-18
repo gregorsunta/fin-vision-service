@@ -1,22 +1,16 @@
 import { FastifyReply, FastifyRequest } from 'fastify';
-import { db, users } from '../db/index.js';
-import { eq } from 'drizzle-orm';
-
-// Define the shape of the user object that will be attached to the request
-export interface AuthenticatedUser {
-  id: number;
-}
+import { verifyToken, UserPayload } from '../services/authService.js';
 
 // Define the shape of what our auth hook will attach to the request
 declare module 'fastify' {
   interface FastifyRequest {
-    user?: AuthenticatedUser;
+    user?: UserPayload;
     isInternal?: boolean;
   }
 }
 
 /**
- * A Fastify hook to protect routes. It checks for a valid user API key
+ * A Fastify hook to protect routes. It checks for a valid JWT access token
  * or the internal service-to-service API key.
  *
  * It populates `request.user` or `request.isInternal` if auth is successful.
@@ -25,32 +19,29 @@ declare module 'fastify' {
  * @param reply The Fastify reply object.
  */
 export async function authenticate(request: FastifyRequest, reply: FastifyReply) {
-  const apiKey = request.headers['authorization'];
+  const authHeader = request.headers['authorization'];
 
-  if (!apiKey) {
+  if (!authHeader) {
     return reply.status(401).send({ error: 'Authorization header is missing.' });
   }
 
-  // Check if it's the internal service key
-  if (apiKey === process.env.INTERNAL_API_KEY) {
+  // Check if it's the internal service key first
+  if (authHeader === process.env.INTERNAL_API_KEY) {
     request.isInternal = true;
-    return; // Success
+    return; // Success for internal service
   }
 
-  // Otherwise, look for a user with this key
+  // Check for a JWT Bearer token
+  const [scheme, token] = authHeader.split(' ');
+  if (scheme !== 'Bearer' || !token) {
+    return reply.status(401).send({ error: 'Invalid authorization format. Expected "Bearer <token>".' });
+  }
+
   try {
-    const userResult = await db.query.users.findFirst({
-      where: eq(users.apiKey, apiKey),
-      columns: { id: true },
-    });
-
-    if (!userResult) {
-      return reply.status(401).send({ error: 'Invalid API Key.' });
-    }
-
-    request.user = { id: userResult.id };
+    const decoded = verifyToken<UserPayload>(token, process.env.JWT_SECRET!);
+    request.user = decoded;
   } catch (error) {
-    request.log.error(error, 'Error during authentication lookup');
-    return reply.status(500).send({ error: 'Internal Server Error' });
+    request.log.warn(error, 'JWT verification failed');
+    return reply.status(401).send({ error: 'Invalid or expired access token.' });
   }
 }
