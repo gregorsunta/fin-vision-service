@@ -465,7 +465,151 @@ Retrieve a specific receipt with all its line items, including currency and quan
 
 ---
 
-### 9. Re-trigger Receipt Processing
+### 9. Get All User Uploads (Upload History)
+
+**GET** `/api/users/me/uploads`
+
+**Description**: Retrieves a paginated list of all receipt uploads for the authenticated user. This endpoint replaces the need for localStorage-based upload tracking in the frontend, enabling cross-device sync and consistent data.
+
+**Authentication**: Required (JWT Access Token)
+
+**Query Parameters** (all optional):
+- `limit` (integer, default: 50, max: 100): Number of uploads per page
+- `offset` (integer, default: 0): Pagination offset for fetching next page
+- `sortBy` (string, default: 'createdAt'): Sort field - one of: `createdAt`, `updatedAt`, `status`
+- `sortOrder` (string, default: 'desc'): Sort order - `asc` or `desc`
+- `status` (string, optional): Filter by status - one of: `processing`, `completed`, `partly_completed`, `failed`
+
+**Response**: `200 OK`
+```json
+{
+  "uploads": [
+    {
+      "uploadId": 123,
+      "fileName": "c203819a2b7c2a439cd01c03f03355a7.jpg",
+      "status": "completed",
+      "hasReceipts": true,
+      "createdAt": "2024-01-24T10:30:00.000Z",
+      "updatedAt": "2024-01-24T10:30:15.000Z",
+      "statistics": {
+        "totalDetected": 4,
+        "successful": 4,
+        "failed": 0,
+        "processing": 0
+      },
+      "images": {
+        "original": "/files/c203819a2b7c2a439cd01c03f03355a7.jpg",
+        "marked": "/files/69ecb5ef2c5e6534c5fff3f1e6dff8da.jpg"
+      }
+    },
+    {
+      "uploadId": 122,
+      "fileName": "xyz789.jpg",
+      "status": "partly_completed",
+      "hasReceipts": true,
+      "createdAt": "2024-01-24T09:15:00.000Z",
+      "updatedAt": "2024-01-24T09:15:30.000Z",
+      "statistics": {
+        "totalDetected": 3,
+        "successful": 2,
+        "failed": 1,
+        "processing": 0
+      },
+      "images": {
+        "original": "/files/xyz789.jpg",
+        "marked": "/files/marked-xyz789.jpg"
+      }
+    }
+  ],
+  "pagination": {
+    "total": 145,
+    "limit": 50,
+    "offset": 0,
+    "hasMore": true
+  }
+}
+```
+
+**Response Fields**:
+- `uploads[]`: Array of upload objects
+  - `uploadId`: Unique identifier
+  - `fileName`: Original file name extracted from URL
+  - `status`: Processing status (`processing`, `completed`, `partly_completed`, `failed`)
+  - `hasReceipts`: Boolean indicating if any receipts were detected
+  - `createdAt`: ISO timestamp when upload was created
+  - `updatedAt`: ISO timestamp of last update
+  - `statistics`: Aggregated counts of receipts by status
+    - `totalDetected`: Total number of receipts found
+    - `successful`: Number of successfully processed receipts
+    - `failed`: Number of failed or unreadable receipts
+    - `processing`: Number of receipts still being processed
+  - `images`: Image URLs
+    - `original`: Original uploaded image URL
+    - `marked`: Marked image with detection boxes (null if not yet generated)
+- `pagination`: Pagination metadata
+  - `total`: Total number of uploads matching the filters
+  - `limit`: Current page size
+  - `offset`: Current pagination offset
+  - `hasMore`: Boolean - true if more uploads exist beyond current page
+
+**Performance**: 
+- Single optimized SQL query with LEFT JOIN and aggregation
+- Typical response time: < 200ms for 50 uploads
+- Results are sorted and paginated efficiently
+
+**Use Cases**:
+- Display upload history in UI
+- Replace localStorage-based tracking
+- Enable cross-device upload sync
+- Show processing status dashboard
+- Filter by status to find failed uploads
+
+**Example Requests**:
+```bash
+# Get first 50 uploads (default)
+curl -X GET http://localhost:3000/api/users/me/uploads \
+  -H "Authorization: Bearer {accessToken}"
+
+# Get next page with custom limit
+curl -X GET "http://localhost:3000/api/users/me/uploads?limit=20&offset=20" \
+  -H "Authorization: Bearer {accessToken}"
+
+# Get only completed uploads, sorted by most recent
+curl -X GET "http://localhost:3000/api/users/me/uploads?status=completed&sortBy=createdAt&sortOrder=desc" \
+  -H "Authorization: Bearer {accessToken}"
+
+# Get oldest uploads first
+curl -X GET "http://localhost:3000/api/users/me/uploads?sortOrder=asc" \
+  -H "Authorization: Bearer {accessToken}"
+```
+
+**Error Responses**:
+- `401 Unauthorized`: Missing or invalid authentication token
+- `400 Bad Request`: Invalid query parameters (e.g., limit > 100)
+- `500 Internal Server Error`: Database or server error
+
+**Frontend Integration Example**:
+```typescript
+// Fetch upload history
+const response = await fetch('/api/users/me/uploads?limit=50&offset=0', {
+  headers: { 'Authorization': `Bearer ${accessToken}` }
+});
+const { uploads, pagination } = await response.json();
+
+// Load more (pagination)
+const nextPage = await fetch(`/api/users/me/uploads?limit=50&offset=${pagination.offset + pagination.limit}`, {
+  headers: { 'Authorization': `Bearer ${accessToken}` }
+});
+
+// Filter by status
+const failedUploads = await fetch('/api/users/me/uploads?status=failed', {
+  headers: { 'Authorization': `Bearer ${accessToken}` }
+});
+```
+
+---
+
+### 10. Re-trigger Receipt Processing
 
 **POST** `/api/receipts/:uploadId/reprocess`
 

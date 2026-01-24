@@ -27,6 +27,7 @@
 | Method | Endpoint | Auth Required | Description |
 |--------|----------|---------------|-------------|
 | GET | `/api/files/:filename` | Yes | Get uploaded image file |
+| GET | `/api/users/me/uploads` | Yes | Get all uploads for user (paginated) |
 | GET | `/api/users/me/receipts/export-csv` | Yes | Export all receipts as CSV |
 
 ---
@@ -69,7 +70,14 @@
    → Use imageUrl from receipt object
 ```
 
-### 4. Export Data
+### 4. View Upload History
+```
+GET /api/users/me/uploads
+→ Returns paginated list of all user uploads with statistics
+→ Query params: ?limit=50&offset=0&sortBy=createdAt&sortOrder=desc&status=completed
+```
+
+### 5. Export Data
 ```
 GET /api/users/me/receipts/export-csv
 → Download CSV file with all user receipts

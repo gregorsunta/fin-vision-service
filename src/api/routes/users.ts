@@ -1,7 +1,7 @@
 import { randomBytes } from 'crypto';
 import { FastifyInstance } from 'fastify';
 import { db, users, receiptUploads, receipts } from '../../db/index.js';
-import { eq, inArray } from 'drizzle-orm';
+import { eq, inArray, desc, asc, sql, count } from 'drizzle-orm';
 import { authenticate } from '../auth.js';
 import { generateReceiptsCsv } from '../../services/csvGenerator.js';
 import {
@@ -137,6 +137,113 @@ export default async function userRoutes(server: FastifyInstance) {
     reply.status(204).send();
   });
 
+
+  // --- Get All Uploads for Authenticated User ---
+  server.get('/users/me/uploads', { preHandler: [authenticate] }, async (request, reply) => {
+    if (!request.user) {
+      return reply.status(401).send({ error: 'Authentication required.' });
+    }
+
+    try {
+      // Parse and validate query parameters
+      const queryParams = request.query as any;
+      const limit = Math.min(Math.max(parseInt(queryParams.limit) || 50, 1), 100);
+      const offset = Math.max(parseInt(queryParams.offset) || 0, 0);
+      const sortBy = ['createdAt', 'updatedAt', 'status'].includes(queryParams.sortBy) 
+        ? queryParams.sortBy 
+        : 'createdAt';
+      const sortOrder = queryParams.sortOrder === 'asc' ? 'asc' : 'desc';
+      const statusFilter = queryParams.status && ['processing', 'completed', 'partly_completed', 'failed'].includes(queryParams.status)
+        ? queryParams.status
+        : null;
+
+      // Build base query conditions
+      let whereConditions = eq(receiptUploads.userId, request.user.id);
+      if (statusFilter) {
+        whereConditions = sql`${receiptUploads.userId} = ${request.user.id} AND ${receiptUploads.status} = ${statusFilter}`;
+      }
+
+      // Get total count for pagination
+      const [{ totalCount }] = await db
+        .select({ totalCount: count() })
+        .from(receiptUploads)
+        .where(statusFilter 
+          ? sql`${receiptUploads.userId} = ${request.user.id} AND ${receiptUploads.status} = ${statusFilter}`
+          : eq(receiptUploads.userId, request.user.id)
+        );
+
+      // Fetch uploads with aggregated receipt statistics using a single optimized query
+      const uploadsWithStats = await db
+        .select({
+          uploadId: receiptUploads.id,
+          originalImageUrl: receiptUploads.originalImageUrl,
+          markedImageUrl: receiptUploads.markedImageUrl,
+          status: receiptUploads.status,
+          hasReceipts: receiptUploads.hasReceipts,
+          createdAt: receiptUploads.createdAt,
+          updatedAt: receiptUploads.updatedAt,
+          totalReceipts: sql<number>`COALESCE(COUNT(${receipts.id}), 0)`,
+          successfulReceipts: sql<number>`COALESCE(SUM(CASE WHEN ${receipts.status} = 'processed' THEN 1 ELSE 0 END), 0)`,
+          failedReceipts: sql<number>`COALESCE(SUM(CASE WHEN ${receipts.status} IN ('failed', 'unreadable') THEN 1 ELSE 0 END), 0)`,
+          processingReceipts: sql<number>`COALESCE(SUM(CASE WHEN ${receipts.status} = 'pending' THEN 1 ELSE 0 END), 0)`,
+        })
+        .from(receiptUploads)
+        .leftJoin(receipts, eq(receipts.uploadId, receiptUploads.id))
+        .where(statusFilter 
+          ? sql`${receiptUploads.userId} = ${request.user.id} AND ${receiptUploads.status} = ${statusFilter}`
+          : eq(receiptUploads.userId, request.user.id)
+        )
+        .groupBy(receiptUploads.id)
+        .orderBy(
+          sortOrder === 'asc' 
+            ? asc(receiptUploads[sortBy as keyof typeof receiptUploads])
+            : desc(receiptUploads[sortBy as keyof typeof receiptUploads])
+        )
+        .limit(limit)
+        .offset(offset);
+
+      // Format response
+      const formattedUploads = uploadsWithStats.map(upload => {
+        // Extract filename from URL
+        const urlParts = upload.originalImageUrl.split('/');
+        const fileName = urlParts[urlParts.length - 1] || 'unknown.jpg';
+
+        return {
+          uploadId: upload.uploadId,
+          fileName: fileName,
+          status: upload.status,
+          hasReceipts: upload.hasReceipts === 1,
+          createdAt: upload.createdAt,
+          updatedAt: upload.updatedAt,
+          statistics: {
+            totalDetected: Number(upload.totalReceipts),
+            successful: Number(upload.successfulReceipts),
+            failed: Number(upload.failedReceipts),
+            processing: Number(upload.processingReceipts),
+          },
+          images: {
+            original: upload.originalImageUrl,
+            marked: upload.markedImageUrl || null,
+          },
+        };
+      });
+
+      // Send response with pagination metadata
+      reply.send({
+        uploads: formattedUploads,
+        pagination: {
+          total: totalCount,
+          limit: limit,
+          offset: offset,
+          hasMore: offset + limit < totalCount,
+        },
+      });
+
+    } catch (error: any) {
+      request.log.error(error, 'Failed to fetch user uploads');
+      reply.status(500).send({ error: 'Could not fetch uploads.', details: error.message });
+    }
+  });
 
   // Route to export all receipt data for the authenticated user as CSV
   server.get('/users/me/receipts/export-csv', { preHandler: [authenticate] }, async (request, reply) => {
