@@ -9,8 +9,8 @@ if (!process.env.DATABASE_URL) {
 
 let connectionString = process.env.DATABASE_URL;
 if (process.env.NODE_ENV === 'development') {
-  // In development, replace the Docker service hostname with localhost
-  connectionString = connectionString.replace('@mysql:', '@localhost:');
+  // In development, replace the Docker service hostname with localhost:3307
+  connectionString = connectionString.replace('@mysql:3306', '@localhost:3307');
 }
 
 export const poolConnection = mysql.createPool(connectionString);

@@ -1,9 +1,10 @@
 import { GoogleGenerativeAI, Part } from '@google/generative-ai';
 
-// Updated structure to include keywords
+// Updated structure to include keywords, quantity units
 export interface ReceiptItem {
   description: string;
   quantity: number;
+  quantityUnit?: string; // e.g., "pieces", "kg", "lbs", "liters", "ml", "oz"
   price: number;
   keywords?: string[];
 }
@@ -65,18 +66,30 @@ export class ReceiptAnalysisService {
         "merchantName": "string",
         "transactionDate": "string (YYYY-MM-DD)",
         "transactionTime": "string (HH:MM:SS)",
-        "items": [{ "description": "string", "quantity": "number", "price": "number", "keywords": ["string", "string"] }],
+        "items": [{ 
+          "description": "string", 
+          "quantity": "number", 
+          "quantityUnit": "string (e.g., 'pieces', 'kg', 'lbs', 'liters', 'ml', 'oz', 'g', 'lb', 'gal')",
+          "price": "number", 
+          "keywords": ["string", "string"] 
+        }],
         "subtotal": "number | null",
         "tax": "number | null",
         "total": "number",
-        "currency": "string (ISO 4217 code, e.g., 'USD')",
+        "currency": "string (ISO 4217 code, e.g., 'USD', 'EUR', 'GBP')",
         "keywords": ["string", "string"]
       }
 
       - The 'total' field is mandatory. If you cannot find it, do not process the receipt.
+      - The 'currency' field should be a 3-letter ISO 4217 currency code. Infer from the receipt's currency symbol or store location.
+      - For 'quantityUnit', determine the unit of measurement for each item:
+        * If the item is sold by weight: use 'kg', 'g', 'lbs', 'oz', etc.
+        * If the item is sold by volume: use 'liters', 'ml', 'gal', 'fl oz', etc.
+        * If the item is sold by piece/count: use 'pieces', 'units', 'ea', or 'pcs'
+        * If no unit is specified or it's a single item, default to 'pieces'
       - For 'keywords' at the root level, provide general categories for the overall purchase (e.g., "groceries", "electronics", "dinner").
       - For 'keywords' at the item level, provide specific categories for each item (e.g., "fruit", "vegetable", "beverage", "CPU").
-      - If a value is not present, use null where allowed (subtotal, tax).
+      - If a value is not present, use null where allowed (subtotal, tax, quantityUnit).
       - Ensure all monetary values are numbers, not strings.
 
       Return your response as a single, clean JSON object. Do not include any other text, explanation, or markdown code fences.

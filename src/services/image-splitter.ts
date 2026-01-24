@@ -60,21 +60,31 @@ export class ImageSplitterService {
         throw new Error('Could not get image dimensions');
       }
 
-      for (const box of detectedBoundingBoxes) {
+      console.log(`Image dimensions: ${imageWidth}x${imageHeight}`);
+      console.log(`Processing ${detectedBoundingBoxes.length} detected bounding boxes...`);
+
+      for (let i = 0; i < detectedBoundingBoxes.length; i++) {
+        const box = detectedBoundingBoxes[i];
+        console.log(`\nBox ${i + 1} - Gemini coordinates (1000x1000 grid):`, box);
+        
         // Convert 1000x1000 grid coordinates to actual pixel coordinates
         const pixelX = Math.round((box.x / 1000) * imageWidth);
         const pixelY = Math.round((box.y / 1000) * imageHeight);
         const pixelWidth = Math.round((box.width / 1000) * imageWidth);
         const pixelHeight = Math.round((box.height / 1000) * imageHeight);
 
-        // Add 2.5% padding to each side as a safety margin
-        const paddingWidth = Math.round(pixelWidth * 0.025);
-        const paddingHeight = Math.round(pixelHeight * 0.025);
+        console.log(`Box ${i + 1} - Converted to pixels: x=${pixelX}, y=${pixelY}, width=${pixelWidth}, height=${pixelHeight}`);
+
+        // Add 5% padding to each side as a safety margin to compensate for detection inaccuracies
+        const paddingWidth = Math.round(pixelWidth * 0.05);
+        const paddingHeight = Math.round(pixelHeight * 0.05);
 
         const paddedX = pixelX - paddingWidth;
         const paddedY = pixelY - paddingHeight;
         const paddedWidth = pixelWidth + (paddingWidth * 2);
         const paddedHeight = pixelHeight + (paddingHeight * 2);
+
+        console.log(`Box ${i + 1} - After padding: x=${paddedX}, y=${paddedY}, width=${paddedWidth}, height=${paddedHeight}`);
 
         const left = Math.max(0, paddedX);
         const top = Math.max(0, paddedY);
@@ -127,9 +137,17 @@ export class ImageSplitterService {
         {"x": int, "y": int, "width": int, "height": int},
         {"x": int, "y": int, "width": int, "height": int}
       ]
-      These coordinates (x, y, width, height) should be relative to a 1000x1000 grid where [0,0] is the top-left and [1000,1000] is the bottom-right. 
-      It is critical that you are generous with the bounding boxes. Ensure the coordinates encapsulate the *entire* paper receipt, even if it means including a small margin of the background. Do not cut off any part of the receipt.
-      Do not include any other text or explanation in your response, only the JSON array.
+      
+      IMPORTANT INSTRUCTIONS:
+      - Coordinates (x, y, width, height) should be relative to a 1000x1000 grid where [0,0] is the top-left and [1000,1000] is the bottom-right
+      - x is the LEFT edge of the receipt, y is the TOP edge
+      - width is the FULL width of the receipt from left to right edge
+      - height is the FULL height of the receipt from top to bottom edge
+      - BE VERY GENEROUS with bounding boxes - include extra margin (at least 5% on all sides) to ensure NO part of any receipt is cut off
+      - For receipts arranged horizontally (side by side), make sure each box captures the COMPLETE receipt including all text, barcodes, and edges
+      - If receipts are side-by-side, ensure the boxes don't drift or become misaligned - each receipt should have accurate independent coordinates
+      - Double-check that the rightmost receipts are fully captured, not cut off
+      - Return ONLY the JSON array, no other text or explanation
     `;
 
     try {
