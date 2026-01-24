@@ -1,7 +1,7 @@
 import { FastifyInstance } from 'fastify';
 import { authenticate } from '../auth.js';
 import { db, receipts, receiptUploads } from '../../db/index.js';
-import { eq } from 'drizzle-orm';
+import { eq, or } from 'drizzle-orm';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
@@ -33,7 +33,10 @@ export default async function fileRoutes(
       if (!receipt || !receipt.upload) {
         // Also check if it's an original or marked image from the uploads table
         const upload = await db.query.receiptUploads.findFirst({
-          where: eq(receiptUploads.originalImageUrl, publicImageUrl) || eq(receiptUploads.markedImageUrl, publicImageUrl),
+          where: or(
+            eq(receiptUploads.originalImageUrl, publicImageUrl),
+            eq(receiptUploads.markedImageUrl, publicImageUrl)
+          ),
           columns: { userId: true },
         });
 
