@@ -2,9 +2,9 @@ import { GoogleGenerativeAI, Part } from '@google/generative-ai';
 
 // Updated structure to include keywords, quantity units
 export interface ReceiptItem {
-  description: string;
+  description: string; // Includes package size if applicable (e.g., "Coca Cola 500ml")
   quantity: number;
-  quantityUnit?: string; // e.g., "pieces", "kg", "lbs", "liters", "ml", "oz"
+  quantityUnit?: string; // "pc" for packaged items with size in description, or "kg"/"g"/"L"/"ml" for bulk/measured items
   price: number;
   keywords?: string[];
 }
@@ -82,15 +82,25 @@ export class ReceiptAnalysisService {
 
       - The 'total' field is mandatory. If you cannot find it, do not process the receipt.
       - The 'currency' field should be a 3-letter ISO 4217 currency code. Infer from the receipt's currency symbol or store location.
-      - For 'quantityUnit', determine the unit of measurement for each item:
-        * If the item is sold by weight: use 'kg', 'g', 'lbs', 'oz', etc.
-        * If the item is sold by volume: use 'liters', 'ml', 'gal', 'fl oz', etc.
-        * If the item is sold by piece/count: use 'pieces', 'units', 'ea', or 'pcs'
-        * If no unit is specified or it's a single item, default to 'pieces'
+      - For 'quantityUnit', follow this CRITICAL logic:
+        * FIRST: Check if the item description already contains a size/weight/volume (e.g., "500g", "1L", "250ml", "1.5kg", "330ml")
+          → If YES: Use 'pc' (pieces) as the unit, because the size is part of the product identity
+          → Examples:
+            - "Coca Cola 500ml" → quantity: 2, quantityUnit: "pc" (bought 2 bottles)
+            - "Sončnična margarina 500g" → quantity: 1, quantityUnit: "pc" (bought 1 package)
+            - "Mleko 1L" → quantity: 3, quantityUnit: "pc" (bought 3 cartons)
+        * SECOND: If the description does NOT contain a size, the item is sold by measurement:
+          → Use the actual measurement unit: 'kg', 'g', 'L', 'ml', 'lb', 'oz'
+          → Examples:
+            - "Pasirani paradižnik" → quantity: 0.350, quantityUnit: "kg" (weighed at checkout)
+            - "Banana" → quantity: 1.250, quantityUnit: "kg" (sold by weight)
+            - "Fresh tomatoes" → quantity: 0.5, quantityUnit: "kg" (bulk/self-serve)
+        * Common patterns that indicate packaged items: "500g", "1L", "250ml", "1.5kg", "330ml", "750ml", "2L", "100g"
       - For 'keywords' at the root level, provide general categories for the overall purchase (e.g., "groceries", "electronics", "dinner").
       - For 'keywords' at the item level, provide specific categories for each item (e.g., "fruit", "vegetable", "beverage", "CPU").
       - If a value is not present, use null where allowed (subtotal, tax, quantityUnit).
       - Ensure all monetary values are numbers, not strings.
+      - Include package sizes in the description when visible on the receipt (e.g., write "Coca Cola 500ml" not just "Coca Cola").
 
       Return your response as a single, clean JSON object. Do not include any other text, explanation, or markdown code fences.
     `;
