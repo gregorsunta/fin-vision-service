@@ -28,7 +28,25 @@ const receiptProcessorWorker = new Worker<ReceiptJobData>('receipt-processing', 
     }
 
     try {
-        const imageBuffer = await fs.readFile(imagePath);
+        // imagePath can be:
+        // 1. Full absolute path: /Users/.../uploads/file.jpg (from initial upload)
+        // 2. Relative path: uploads/file.jpg (from reprocess)
+        // 3. Just filename: file.jpg (shouldn't happen but handle it)
+        let fullImagePath: string;
+        
+        if (imagePath.startsWith('/')) {
+            // Absolute path - use as is
+            fullImagePath = imagePath;
+        } else if (imagePath.startsWith('uploads/')) {
+            // Already has uploads/ prefix - use as is
+            fullImagePath = imagePath;
+        } else {
+            // Just filename - add uploads/ prefix
+            fullImagePath = `uploads/${imagePath}`;
+        }
+        
+        console.log(`Job ${job.id}: Reading image from: ${fullImagePath}`);
+        const imageBuffer = await fs.readFile(fullImagePath);
 
         // 1. Split the image
         await job.updateProgress(5);
@@ -109,11 +127,30 @@ const receiptProcessorWorker = new Worker<ReceiptJobData>('receipt-processing', 
                             receiptId: receiptRecordId,
                             description: item.description,
                             amount: item.quantity.toString(),
-                            unit: item.quantityUnit || 'pcs',
+                            unit: item.quantityUnit || 'pc',
                             totalPrice: item.price.toString(),
                             keywords: item.keywords,
                         }))
                     );
+                }
+
+                // Store validation warnings in the database
+                if (extractedData.validationIssues && extractedData.validationIssues.length > 0) {
+                    console.warn(`Job ${job.id}: Receipt ${receiptRecordId} has ${extractedData.validationIssues.length} validation issue(s)`);
+                    
+                    for (const issue of extractedData.validationIssues) {
+                        await db.insert(processingErrors).values({
+                            uploadId: uploadId,
+                            receiptId: receiptRecordId,
+                            category: 'VALIDATION_WARNING',
+                            message: `${issue.type}: ${issue.message}`,
+                            metadata: {
+                                severity: issue.severity,
+                                type: issue.type,
+                                details: issue.details,
+                            },
+                        });
+                    }
                 }
 
                 console.log(`Job ${job.id}: Receipt ${i+1}/${totalReceipts} processed successfully. Checking for duplicates...`);

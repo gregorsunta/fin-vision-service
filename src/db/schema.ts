@@ -42,7 +42,7 @@ export const processingErrors = mysqlTable('processing_errors', {
   id: serial('id').primaryKey(),
   uploadId: int('upload_id').notNull(),
   receiptId: int('receipt_id'), // Can be null if the error is for the whole upload
-  category: mysqlEnum('category', ['IMAGE_QUALITY', 'EXTRACTION_FAILURE', 'SYSTEM_ERROR']).notNull(),
+  category: mysqlEnum('category', ['IMAGE_QUALITY', 'EXTRACTION_FAILURE', 'SYSTEM_ERROR', 'VALIDATION_WARNING']).notNull(),
   message: text('message'),
   metadata: json('metadata'),
   createdAt: timestamp('created_at').defaultNow().notNull(),

@@ -1,8 +1,11 @@
 import { randomBytes } from 'crypto';
 import { FastifyInstance } from 'fastify';
-import { db, users, receiptUploads, receipts } from '../../db/index.js';
-import { eq, inArray, desc, asc, sql, count } from 'drizzle-orm';
+import { db, users, receiptUploads, receipts, lineItems, processingErrors, duplicateMatches } from '../../db/index.js';
+import { eq, inArray, desc, asc, sql, count, or } from 'drizzle-orm';
 import { authenticate } from '../auth.js';
+import fs from 'fs/promises';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import { generateReceiptsCsv } from '../../services/csvGenerator.js';
 import {
   hashPassword,
@@ -242,6 +245,149 @@ export default async function userRoutes(server: FastifyInstance) {
     } catch (error: any) {
       request.log.error(error, 'Failed to fetch user uploads');
       reply.status(500).send({ error: 'Could not fetch uploads.', details: error.message });
+    }
+  });
+
+  // --- Delete All User Data ---
+  server.delete('/users/me/data', { preHandler: [authenticate] }, async (request, reply) => {
+    if (!request.user) {
+      return reply.status(401).send({ error: 'Authentication required.' });
+    }
+
+    const userId = request.user.id;
+
+    try {
+      request.log.info(`User ${userId} requested complete data deletion`);
+
+      // 1. Get all uploads for this user to collect image file paths
+      const userUploads = await db
+        .select({
+          id: receiptUploads.id,
+          originalImageUrl: receiptUploads.originalImageUrl,
+          markedImageUrl: receiptUploads.markedImageUrl,
+        })
+        .from(receiptUploads)
+        .where(eq(receiptUploads.userId, userId));
+
+      if (userUploads.length === 0) {
+        return reply.send({
+          message: 'No data found to delete.',
+          deletedCounts: {
+            uploads: 0,
+            receipts: 0,
+            lineItems: 0,
+            errors: 0,
+            duplicateMatches: 0,
+            files: 0,
+          },
+        });
+      }
+
+      const uploadIds = userUploads.map(u => u.id);
+
+      // 2. Get all receipts for these uploads to collect receipt image paths
+      const userReceipts = await db
+        .select({
+          id: receipts.id,
+          imageUrl: receipts.imageUrl,
+        })
+        .from(receipts)
+        .where(inArray(receipts.uploadId, uploadIds));
+
+      const receiptIds = userReceipts.map(r => r.id);
+
+      // 3. Collect all file paths to delete
+      const filesToDelete: string[] = [];
+      const __filename = fileURLToPath(import.meta.url);
+      const __dirname = path.dirname(__filename);
+      const uploadsDir = path.join(__dirname, '../../../uploads');
+
+      // Add upload images (original and marked)
+      for (const upload of userUploads) {
+        if (upload.originalImageUrl) {
+          const filename = upload.originalImageUrl.split('/').pop();
+          if (filename) filesToDelete.push(path.join(uploadsDir, filename));
+        }
+        if (upload.markedImageUrl) {
+          const filename = upload.markedImageUrl.split('/').pop();
+          if (filename) filesToDelete.push(path.join(uploadsDir, filename));
+        }
+      }
+
+      // Add receipt images
+      for (const receipt of userReceipts) {
+        if (receipt.imageUrl) {
+          const filename = receipt.imageUrl.split('/').pop();
+          if (filename) filesToDelete.push(path.join(uploadsDir, filename));
+        }
+      }
+
+      // 4. Delete database records (in correct order to respect foreign keys)
+      let deletedCounts = {
+        uploads: 0,
+        receipts: 0,
+        lineItems: 0,
+        errors: 0,
+        duplicateMatches: 0,
+        files: 0,
+      };
+
+      if (receiptIds.length > 0) {
+        // Delete line items
+        const lineItemsResult = await db.delete(lineItems).where(inArray(lineItems.receiptId, receiptIds));
+        deletedCounts.lineItems = lineItemsResult.rowsAffected || 0;
+
+        // Delete duplicate matches (both where this receipt is the source or the target)
+        const duplicateMatchesResult = await db.delete(duplicateMatches).where(
+          or(
+            inArray(duplicateMatches.receiptId, receiptIds),
+            inArray(duplicateMatches.potentialDuplicateId, receiptIds)
+          )
+        );
+        deletedCounts.duplicateMatches = duplicateMatchesResult.rowsAffected || 0;
+      }
+
+      if (uploadIds.length > 0) {
+        // Delete processing errors
+        const errorsResult = await db.delete(processingErrors).where(inArray(processingErrors.uploadId, uploadIds));
+        deletedCounts.errors = errorsResult.rowsAffected || 0;
+
+        // Delete receipts
+        const receiptsResult = await db.delete(receipts).where(inArray(receipts.uploadId, uploadIds));
+        deletedCounts.receipts = receiptsResult.rowsAffected || 0;
+
+        // Delete uploads
+        const uploadsResult = await db.delete(receiptUploads).where(eq(receiptUploads.userId, userId));
+        deletedCounts.uploads = uploadsResult.rowsAffected || 0;
+      }
+
+      // 5. Delete physical files from disk
+      for (const filePath of filesToDelete) {
+        try {
+          await fs.unlink(filePath);
+          deletedCounts.files++;
+          request.log.info(`Deleted file: ${filePath}`);
+        } catch (err: any) {
+          // File might not exist or already deleted - log but don't fail
+          if (err.code !== 'ENOENT') {
+            request.log.warn(`Failed to delete file ${filePath}: ${err.message}`);
+          }
+        }
+      }
+
+      request.log.info(`User ${userId} data deletion completed:`, deletedCounts);
+
+      return reply.send({
+        message: 'All your data has been successfully deleted.',
+        deletedCounts,
+      });
+
+    } catch (error: any) {
+      request.log.error(error, 'Failed to delete user data');
+      return reply.status(500).send({ 
+        error: 'Failed to delete user data.', 
+        details: error.message 
+      });
     }
   });
 

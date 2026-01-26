@@ -154,6 +154,14 @@ npm run db:migrate
     ```
 ## API Endpoints
 
+### Data Management
+- `DELETE /api/users/me/data` - Delete all user data (GDPR compliance)
+  - **Authentication**: Required (JWT Bearer token)
+  - **Response**: Returns count of deleted items (uploads, receipts, line items, errors, files)
+  - **WARNING**: This is irreversible and deletes ALL user data including uploaded images
+
+## Detailed API Endpoints
+
 -   `POST /api/receipts`: Upload a receipt image for processing. The request should be a `multipart/form-data` with a file field.
 -   `GET /health`: Health check endpoint.
 
