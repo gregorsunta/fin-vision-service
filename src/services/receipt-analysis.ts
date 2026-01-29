@@ -1,12 +1,22 @@
 import { GoogleGenerativeAI, Part } from '@google/generative-ai';
 
-// Updated structure to include keywords, quantity units
+// Updated structure to include keywords, quantity units, and item type
 export interface ReceiptItem {
-  description: string; // Includes package size if applicable (e.g., "Coca Cola 500ml")
+  description: string;
   quantity: number;
-  quantityUnit?: string; // "pc" for packaged items with size in description, or "kg"/"g"/"L"/"ml" for bulk/measured items
-  price: number;
+  quantityUnit?: string;
+  unitPrice: number;
+  lineTotal?: number; // Computed after parsing: quantity × unitPrice
   keywords?: string[];
+
+  itemType?: 'product' | 'discount' | 'tax' | 'tip' | 'fee' | 'refund' | 'adjustment';
+
+  discountMetadata?: {
+    type?: 'percentage' | 'fixed' | 'coupon' | 'loyalty' | 'promotion';
+    value?: number;
+    code?: string;
+    originalPrice?: number;
+  };
 }
 
 export interface ValidationIssue {
@@ -73,60 +83,111 @@ export class ReceiptAnalysisService {
       STEP 2: UNDERSTAND THE RECEIPT LAYOUT
       Most receipts follow this pattern:
       [Item Description] [Quantity/Weight] [Unit Price] [Total Line Price]
-      
+
       Example receipt line:
       Coca Cola 500ml    2 x €1.50    €3.00
       └─ Description ─┘  └Qty×Unit─┘  └Total─┘
-      
+
       STEP 3: EXTRACT DATA WITH PRECISION
-      
+
       CRITICAL RULES FOR PRICE EXTRACTION:
       ════════════════════════════════════
-      1. Each line item has ONE price - this is the TOTAL for that line (quantity × unit price)
-      2. The line total is ALWAYS the rightmost number on the line (ignore any numbers before it)
-      3. Process the receipt line by line, from top to bottom
-      4. If a line has multiple numbers, identify which is:
-         - Product code (usually near start, no currency symbol)
+      1. Each PRODUCT results in exactly ONE item in the output - never duplicate items
+      2. The 'unitPrice' field is the PRICE PER UNIT (per piece, per kg, etc.) — NOT the line total
+      3. If a line has multiple numbers, identify which is:
+         - Product code (usually near start, no currency symbol) - IGNORE
          - Quantity (small number like 1, 2, 3 or weight like 0.350)
-         - Unit price (middle column, may have "×" before it)
-         - LINE TOTAL (rightmost column - THIS IS WHAT YOU EXTRACT as 'price')
-      5. Match each line total to its description EXACTLY - do not mix up lines
-      
+         - Unit price (the price for ONE unit — THIS IS WHAT YOU EXTRACT as 'unitPrice')
+         - Line total (rightmost column — DO NOT extract this; it will be computed in code)
+      4. For items with quantity=1, the unit price and line total are the same — extract that number as 'unitPrice'
+      5. Match each unit price to its description EXACTLY - do not mix up lines
+
+      ████████████████████████████████████████████████████████████████████████
+      ██  MULTI-LINE RECEIPT FORMAT (CRITICAL - SLOVENIAN/EUROPEAN STORES) ██
+      ████████████████████████████████████████████████████████████████████████
+
+      Many receipts (especially Hofer/Aldi, Mercator, Spar, Lidl in Slovenia) use a
+      MULTI-LINE format where an item spans TWO lines:
+
+      Line 1: Item name only (NO price on this line)
+      Line 2: Quantity breakdown → "N KOS × unit_price" or "N × unit_price" followed by line total
+
+      EXAMPLE (Slovenian Hofer receipt):
+      ─────────────────────────────────────────
+      Pasirani paradižnik 500g
+        4 KOS × 0,57                     2,28
+      Piščančja posebna klobasa IK 400g
+        3 KOS × 0,84                     2,52
+      Zelje
+        1,688 kg × 0,93                  1,57
+      ─────────────────────────────────────────
+
+      CORRECT extraction:
+      → { description: "Pasirani paradižnik 500g", quantity: 4, quantityUnit: "pc", unitPrice: 0.57 }
+      → { description: "Piščančja posebna klobasa IK 400g", quantity: 3, quantityUnit: "pc", unitPrice: 0.84 }
+      → { description: "Zelje", quantity: 1.688, quantityUnit: "kg", unitPrice: 0.93 }
+
+      WRONG (DO NOT DO THIS):
+      ✗ Creating 4 separate items for "Pasirani paradižnik 500g" at €0.57 each
+      ✗ Using the line total (2.28) instead of the unit price (0.57) for 'unitPrice'
+      ✗ Treating the quantity breakdown line as a separate item
+
+      KEY RECOGNITION PATTERNS for multi-line items:
+      - "N KOS ×" or "N KOS x" (KOS = pieces in Slovenian)
+      - "N × price" on an indented line below an item name
+      - "N,NNN kg × price" for weighed items
+      - The line total appears at the END of the quantity breakdown line
+      - If you see the SAME item name repeated multiple times, you are likely
+        misreading a multi-line format. STOP and re-examine the receipt layout.
+
       VISUAL ALIGNMENT EXAMPLE:
       ─────────────────────────────────────────
-      Description             Qty    Price
+      Description             Qty    UnitPrice
       ─────────────────────────────────────────
-      Milk 1L                 1      €2.50  ← Extract €2.50
-      Bread                   2      €3.00  ← Extract €3.00
-      Banana (kg)             0.5    €1.25  ← Extract €1.25
+      Milk 1L                 1      €2.50  ← Extract unitPrice=2.50
+      Bread                   2      €1.50  ← Extract unitPrice=1.50
+      Banana (kg)             0.5    €2.50  ← Extract unitPrice=2.50
       ─────────────────────────────────────────
-      SUBTOTAL                       €6.75
-      TAX (20%)                      €1.35
-      TOTAL                          €8.10
-      ─────────────────────────────────────────
-      
+
       COMMON RECEIPT FORMATS TO HANDLE:
-      
-      Format 1: Simple (Description + Price)
+
+      Format 1: Simple (Description + Price on same line)
       Milk 1L                €2.50
-      → Extract: description="Milk 1L", price=2.50
-      
-      Format 2: With Quantity
+      → Extract: description="Milk 1L", quantity=1, unitPrice=2.50
+
+      Format 2: With Quantity on same line
       Milk 1L    2x €1.25    €2.50
-      → Extract: description="Milk 1L", quantity=2, price=2.50 (NOT 1.25!)
-      
-      Format 3: Weight-based
+      → Extract: description="Milk 1L", quantity=2, unitPrice=1.25 (the per-unit price, NOT the line total!)
+
+      Format 3: Multi-line with quantity breakdown (COMMON IN SLOVENIAN STORES)
+      Pasirani paradižnik 500g
+        4 KOS × 0,57         2,28
+      → Extract: description="Pasirani paradižnik 500g", quantity=4, unitPrice=0.57
+      → This is ONE item, NOT four separate items!
+
+      Format 4: Weight-based
       Banana                 0.350 kg  €1.99/kg  €0.70
-      → Extract: description="Banana", quantity=0.350, price=0.70 (NOT 1.99!)
-      
-      Format 4: Compact (numbers close together)
+      → Extract: description="Banana", quantity=0.350, quantityUnit="kg", unitPrice=1.99 (the per-kg price!)
+
+      Format 5: Multi-line weight-based
+      Zelje
+        1,688 kg × 0,93      1,57
+      → Extract: description="Zelje", quantity=1.688, quantityUnit="kg", unitPrice=0.93
+
+      Format 6: Compact (numbers close together)
       Coca Cola 500ml  2  1.50  3.00
-      → Extract: description="Coca Cola 500ml", quantity=2, price=3.00 (rightmost!)
+      → Extract: description="Coca Cola 500ml", quantity=2, unitPrice=1.50 (the per-unit price!)
       
       IMPORTANT VALIDATION:
-      - After extracting all items, sum their prices
+      - After extracting all items, compute each line total as quantity × unitPrice and sum them
       - The sum should equal the receipt TOTAL (not subtotal - item prices include tax)
-      - If your sum is off by more than €0.50, YOU MADE A MISTAKE - review each line again
+      - If your sum is off by more than €0.50, YOU MADE A MISTAKE - go back and review:
+        1. Are you extracting the correct per-unit price for 'unitPrice'?
+        2. Are you creating duplicate items from multi-line quantity breakdowns?
+        3. If the same item name appears multiple times, is it genuinely bought separately
+           or is it a multi-line format showing "N × unit_price = total"?
+      - The number of output items should match the number of DISTINCT purchased products,
+        not the number of physical lines on the receipt
       
       WHAT TO IGNORE:
       - Product codes (e.g., "12345", "SKU-987")
@@ -135,10 +196,30 @@ export class ReceiptAnalysisService {
       - Department codes
       - Running subtotals mid-receipt
       
-      DISCOUNTS:
-      - If you see a discount line (e.g., "DISCOUNT -€2.00"), create a separate item
-      - Use negative price: price=-2.00
-      - Description should include "Discount" or "Rabatt"
+      ITEM TYPE CLASSIFICATION:
+      Each line item must have an "itemType" field that identifies what kind of item it is:
+      
+      - "product" - Regular purchased items (bread, milk, clothes, electronics, etc.)
+      - "discount" - Price reductions, sales, coupons, loyalty discounts
+      - "tax" - Tax lines (VAT, sales tax, etc.)
+      - "tip" - Gratuity/tips
+      - "fee" - Service fees, delivery fees, processing fees
+      - "refund" - Returns or refunds
+      - "adjustment" - Other price adjustments
+      
+      DISCOUNTS - IMPORTANT:
+      When you see discount lines (e.g., "Popust 10%", "DISCOUNT -€2.00", "Rabatt", "Sale"), you MUST:
+      1. Set itemType: "discount"
+      2. Use negative unitPrice: unitPrice=-2.00 (discounts are always negative)
+      3. Include discount metadata:
+         - If percentage discount (e.g., "10% off"): 
+           discountMetadata: { type: "percentage", value: 10 }
+         - If fixed amount discount (e.g., "-€15"):
+           discountMetadata: { type: "fixed", value: 15 }
+         - If coupon/promo code is visible (e.g., "HSC Welcome", "SUMMER20"):
+           discountMetadata: { type: "coupon", code: "HSC_WELCOME", value: 15 }
+      
+      IMPORTANT: Slovenian receipts often use "Popust" for discounts - always mark these as itemType: "discount"
       - For 'quantityUnit', follow this CRITICAL logic:
         * FIRST: Check if the item description already contains a size/weight/volume (e.g., "500g", "1L", "250ml", "1.5kg", "330ml")
           → If YES: Use 'pc' (pieces) as the unit, because the size is part of the product identity
@@ -169,8 +250,14 @@ export class ReceiptAnalysisService {
             "description": "Item name with package size if visible",
             "quantity": 1.5,
             "quantityUnit": "pc" or "kg" or "g" or "L" or "ml",
-            "price": 12.99,
-            "keywords": ["category1", "category2"]
+            "unitPrice": 8.66,
+            "keywords": ["category1", "category2"],
+            "itemType": "product" or "discount" or "tax" or "tip" or "fee",
+            "discountMetadata": {
+              "type": "percentage" or "fixed" or "coupon",
+              "value": 10,
+              "code": "PROMO_CODE"
+            }
           }
         ],
         "subtotal": 50.00,
@@ -184,59 +271,72 @@ export class ReceiptAnalysisService {
       
       Receipt shows:
       ─────────────────────────────────────
-      SuperMart Store
-      2024-01-24  14:30:15
+      HERVIS Sports
+      2026-01-07  15:45:00
       
-      Milk 1L                    €2.50
-      Bread                      €1.80
-      Coca Cola 500ml  2x €1.50  €3.00
-      Banana        0.450kg @€2.20/kg  €0.99
+      HLACE M MARIO XL           €259.99
+      Popust (10%)              -€26.00
+      SMUČARSKA JAKNA M Bally   €114.99
+      Popust (HSC Welcome)       -€15.00
       
-      SUBTOTAL                   €8.29
-      TAX (9%)                   €0.75
-      TOTAL                      €9.04
+      SUBTOTAL                  €333.98
+      TAX (22%)                  €73.48
+      TOTAL                     €407.46
       ─────────────────────────────────────
       
       Your JSON output:
       {
-        "merchantName": "SuperMart Store",
-        "transactionDate": "2024-01-24",
-        "transactionTime": "14:30:15",
+        "merchantName": "HERVIS Sports",
+        "transactionDate": "2026-01-07",
+        "transactionTime": "15:45:00",
         "items": [
           {
-            "description": "Milk 1L",
+            "description": "HLACE M MARIO XL",
             "quantity": 1,
             "quantityUnit": "pc",
-            "price": 2.50,
-            "keywords": ["dairy", "beverage"]
+            "unitPrice": 259.99,
+            "keywords": ["clothing", "pants"],
+            "itemType": "product"
           },
           {
-            "description": "Bread",
+            "description": "Popust (10%)",
             "quantity": 1,
             "quantityUnit": "pc",
-            "price": 1.80,
-            "keywords": ["bakery"]
+            "unitPrice": -26.00,
+            "keywords": ["discount"],
+            "itemType": "discount",
+            "discountMetadata": {
+              "type": "percentage",
+              "value": 10
+            }
           },
           {
-            "description": "Coca Cola 500ml",
-            "quantity": 2,
+            "description": "SMUČARSKA JAKNA M Bally",
+            "quantity": 1,
             "quantityUnit": "pc",
-            "price": 3.00,
-            "keywords": ["beverage", "soft drink"]
+            "unitPrice": 114.99,
+            "keywords": ["clothing", "jacket", "ski"],
+            "itemType": "product"
           },
           {
-            "description": "Banana",
-            "quantity": 0.450,
-            "quantityUnit": "kg",
-            "price": 0.99,
-            "keywords": ["fruit"]
+            "description": "Popust (HSC Welcome)",
+            "quantity": 1,
+            "quantityUnit": "pc",
+            "unitPrice": -15.00,
+            "keywords": ["discount"],
+            "itemType": "discount",
+            "discountMetadata": {
+              "type": "coupon",
+              "code": "HSC_WELCOME",
+              "value": 15
+            }
           }
         ],
-        "subtotal": 8.29,
-        "tax": 0.75,
-        "total": 9.04,
+        "subtotal": 333.98,
+        "tax": 73.48,
+        "total": 407.46,
         "currency": "EUR",
-        "keywords": ["groceries"]
+        "keywords": ["shopping", "sports", "clothing"]
       }
       
       FINAL INSTRUCTION:
@@ -258,7 +358,14 @@ export class ReceiptAnalysisService {
       console.log('Cleaned text (first 200 chars):', cleanedText.substring(0, 200));
       
       const analysisResult: ReceiptData = JSON.parse(cleanedText);
-      
+
+      // Compute lineTotal from quantity × unitPrice in code
+      if (analysisResult.items) {
+        for (const item of analysisResult.items) {
+          item.lineTotal = Math.round(item.quantity * item.unitPrice * 100) / 100;
+        }
+      }
+
       // Validate and log price discrepancies
       this.validatePrices(analysisResult);
       
@@ -277,8 +384,8 @@ export class ReceiptAnalysisService {
     const issues: ValidationIssue[] = [];
     
     try {
-      // Calculate sum of all item prices
-      const calculatedTotal = receipt.items.reduce((sum, item) => sum + item.price, 0);
+      // Calculate sum of all item line totals
+      const calculatedTotal = receipt.items.reduce((sum, item) => sum + (item.lineTotal ?? 0), 0);
       
       // Check if the sum of item prices matches the total (not subtotal - item prices usually include VAT)
       // Allow 0.50 variance for rounding
@@ -292,7 +399,7 @@ export class ReceiptAnalysisService {
             calculatedTotal: calculatedTotal.toFixed(2),
             receiptTotal: receipt.total.toFixed(2),
             difference: diff.toFixed(2),
-            items: receipt.items.map(i => ({ description: i.description, price: i.price })),
+            items: receipt.items.map(i => ({ description: i.description, lineTotal: i.lineTotal })),
           },
         };
         issues.push(issue);
@@ -321,56 +428,73 @@ export class ReceiptAnalysisService {
         }
       }
       
-      // Check for unrealistic prices (e.g., zero or extremely high)
-      // Note: Negative prices are ALLOWED for discounts/refunds
+      // Check for unrealistic or invalid prices
       receipt.items.forEach((item, index) => {
-        // Check if item is a discount (negative price is valid)
-        const isDiscount = item.price < 0 || 
-                           item.description.toLowerCase().includes('discount') ||
-                           item.description.toLowerCase().includes('popust') ||
-                           item.description.toLowerCase().includes('rabatt') ||
-                           item.description.toLowerCase().includes('refund');
-        
-        // Only flag as invalid if price is zero (not negative discount, not positive regular item)
-        if (item.price === 0) {
+        const lt = item.lineTotal ?? 0;
+        const itemType = item.itemType || (lt < 0 ? 'discount' : 'product');
+
+        if (lt === 0) {
           const issue: ValidationIssue = {
             severity: 'error',
             type: 'INVALID_PRICE',
-            message: `Item "${item.description}" has invalid price: ${item.price}`,
+            message: `Item "${item.description}" has a line total of zero.`,
             details: {
               itemIndex: index,
               description: item.description,
-              price: item.price,
+              unitPrice: item.unitPrice,
+              lineTotal: lt,
+              itemType,
             },
           };
           issues.push(issue);
           console.warn(`⚠️  Price validation warning: ${issue.message}`);
         }
-        
-        // Flag negative prices that are NOT discounts (suspicious)
-        if (item.price < 0 && !isDiscount) {
+
+        if (lt < 0 && itemType === 'product') {
           const issue: ValidationIssue = {
             severity: 'warning',
             type: 'INVALID_PRICE',
-            message: `Item "${item.description}" has negative price but doesn't appear to be a discount: ${item.price}`,
+            message: `Item "${item.description}" has a negative line total (${lt}) but is marked as a product. Should be marked as discount/refund.`,
             details: {
               itemIndex: index,
               description: item.description,
-              price: item.price,
+              unitPrice: item.unitPrice,
+              lineTotal: lt,
+              itemType,
             },
           };
           issues.push(issue);
           console.warn(`⚠️  Price validation warning: ${issue.message}`);
         }
-        if (item.price > 10000) {
+
+        if ((itemType === 'discount' || itemType === 'refund') && lt > 0) {
           const issue: ValidationIssue = {
             severity: 'warning',
-            type: 'UNREALISTIC_PRICE',
-            message: `Item "${item.description}" has unusually high price: ${item.price}`,
+            type: 'INVALID_PRICE',
+            message: `Item "${item.description}" is marked as ${itemType} but has a positive line total (${lt}). Discounts should be negative.`,
             details: {
               itemIndex: index,
               description: item.description,
-              price: item.price,
+              unitPrice: item.unitPrice,
+              lineTotal: lt,
+              itemType,
+            },
+          };
+          issues.push(issue);
+          console.warn(`⚠️  Price validation warning: ${issue.message}`);
+        }
+
+        if (itemType === 'product' && lt > 10000) {
+          const issue: ValidationIssue = {
+            severity: 'warning',
+            type: 'UNREALISTIC_PRICE',
+            message: `Item "${item.description}" has an unusually high line total: ${lt}`,
+            details: {
+              itemIndex: index,
+              description: item.description,
+              unitPrice: item.unitPrice,
+              lineTotal: lt,
+              itemType,
             },
           };
           issues.push(issue);

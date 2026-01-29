@@ -88,6 +88,29 @@ export const receipts = mysqlTable('receipts', {
 export const lineItems = mysqlTable('line_items', {
   id: serial('id').primaryKey(),
   receiptId: int('receipt_id').notNull(),
+  
+  // Item type classification
+  itemType: mysqlEnum('item_type', [
+    'product',      // Regular purchased product
+    'discount',     // Price reduction/discount
+    'tax',          // Tax line item
+    'tip',          // Gratuity/tip
+    'fee',          // Service fee, delivery fee, etc.
+    'refund',       // Refund/return
+    'adjustment'    // Other price adjustments
+  ]).default('product').notNull(),
+  
+  // Optional: Link discount/modifier to a parent product
+  parentLineItemId: int('parent_line_item_id'), // Self-reference to line_items.id
+  
+  // Discount-specific metadata
+  discountMetadata: json('discount_metadata').$type<{
+    type?: 'percentage' | 'fixed' | 'coupon' | 'loyalty' | 'promotion';
+    value?: number;           // Percentage value (e.g., 10 for 10%) or fixed amount
+    code?: string;            // Coupon/promo code if applicable
+    originalPrice?: number;   // Original price before discount
+  }>(),
+  
   description: varchar('description', { length: 255 }).notNull(),
   // Renamed 'quantity' to 'amount' for clarity, as it can represent weight, volume, or a simple count.
   amount: decimal('amount', { precision: 10, scale: 3 }).default('1.0'),
@@ -124,10 +147,20 @@ export const receiptsRelations = relations(receipts, ({ one, many }) => ({
   lineItems: many(lineItems),
 }));
 
-export const lineItemsRelations = relations(lineItems, ({ one }) => ({
+export const lineItemsRelations = relations(lineItems, ({ one, many }) => ({
   receipt: one(receipts, {
     fields: [lineItems.receiptId],
     references: [receipts.id],
+  }),
+  // Self-referential relation for parent line item (e.g., discount belongs to product)
+  parentLineItem: one(lineItems, {
+    fields: [lineItems.parentLineItemId],
+    references: [lineItems.id],
+    relationName: 'parentChild',
+  }),
+  // Child modifiers (discounts, adjustments) on this item
+  childModifiers: many(lineItems, {
+    relationName: 'parentChild',
   }),
 }));
 

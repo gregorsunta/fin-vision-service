@@ -53,7 +53,7 @@ export default async function userRoutes(server: FastifyInstance) {
       if (error instanceof z.ZodError) {
         return reply.status(400).send({ error: 'Validation failed', details: error.flatten().fieldErrors });
       }
-      request.log.error(error, 'Failed to create new user');
+      request.log.error({ err: error }, 'Failed to create new user');
       reply.status(500).send({ error: 'Could not create user.', details: error });
     }
   });
@@ -91,7 +91,7 @@ export default async function userRoutes(server: FastifyInstance) {
       if (error instanceof z.ZodError) {
         return reply.status(400).send({ error: 'Validation failed', details: error.flatten().fieldErrors });
       }
-      request.log.error(error, 'Login failed');
+      request.log.error({ err: error }, 'Login failed');
       reply.status(500).send({ error: 'Internal Server Error' });
     }
   });
@@ -161,10 +161,8 @@ export default async function userRoutes(server: FastifyInstance) {
         : null;
 
       // Build base query conditions
-      let whereConditions = eq(receiptUploads.userId, request.user.id);
-      if (statusFilter) {
-        whereConditions = sql`${receiptUploads.userId} = ${request.user.id} AND ${receiptUploads.status} = ${statusFilter}`;
-      }
+
+
 
       // Get total count for pagination
       const [{ totalCount }] = await db
@@ -199,8 +197,8 @@ export default async function userRoutes(server: FastifyInstance) {
         .groupBy(receiptUploads.id)
         .orderBy(
           sortOrder === 'asc' 
-            ? asc(receiptUploads[sortBy as keyof typeof receiptUploads])
-            : desc(receiptUploads[sortBy as keyof typeof receiptUploads])
+            ? asc(receiptUploads[sortBy as keyof typeof receiptUploads] as any)
+            : desc(receiptUploads[sortBy as keyof typeof receiptUploads] as any)
         )
         .limit(limit)
         .offset(offset);
@@ -243,7 +241,7 @@ export default async function userRoutes(server: FastifyInstance) {
       });
 
     } catch (error: any) {
-      request.log.error(error, 'Failed to fetch user uploads');
+      request.log.error({ err: error }, 'Failed to fetch user uploads');
       reply.status(500).send({ error: 'Could not fetch uploads.', details: error.message });
     }
   });
@@ -335,7 +333,7 @@ export default async function userRoutes(server: FastifyInstance) {
       if (receiptIds.length > 0) {
         // Delete line items
         const lineItemsResult = await db.delete(lineItems).where(inArray(lineItems.receiptId, receiptIds));
-        deletedCounts.lineItems = lineItemsResult.rowsAffected || 0;
+        deletedCounts.lineItems = (lineItemsResult as any).affectedRows || 0;
 
         // Delete duplicate matches (both where this receipt is the source or the target)
         const duplicateMatchesResult = await db.delete(duplicateMatches).where(
@@ -344,21 +342,21 @@ export default async function userRoutes(server: FastifyInstance) {
             inArray(duplicateMatches.potentialDuplicateId, receiptIds)
           )
         );
-        deletedCounts.duplicateMatches = duplicateMatchesResult.rowsAffected || 0;
+        deletedCounts.duplicateMatches = (duplicateMatchesResult as any).affectedRows || 0;
       }
 
       if (uploadIds.length > 0) {
         // Delete processing errors
         const errorsResult = await db.delete(processingErrors).where(inArray(processingErrors.uploadId, uploadIds));
-        deletedCounts.errors = errorsResult.rowsAffected || 0;
+        deletedCounts.errors = (errorsResult as any).affectedRows || 0;
 
         // Delete receipts
         const receiptsResult = await db.delete(receipts).where(inArray(receipts.uploadId, uploadIds));
-        deletedCounts.receipts = receiptsResult.rowsAffected || 0;
+        deletedCounts.receipts = (receiptsResult as any).affectedRows || 0;
 
         // Delete uploads
         const uploadsResult = await db.delete(receiptUploads).where(eq(receiptUploads.userId, userId));
-        deletedCounts.uploads = uploadsResult.rowsAffected || 0;
+        deletedCounts.uploads = (uploadsResult as any).affectedRows || 0;
       }
 
       // 5. Delete physical files from disk
@@ -375,7 +373,7 @@ export default async function userRoutes(server: FastifyInstance) {
         }
       }
 
-      request.log.info(`User ${userId} data deletion completed:`, deletedCounts);
+      request.log.info({ details: deletedCounts }, `User ${userId} data deletion completed`);
 
       return reply.send({
         message: 'All your data has been successfully deleted.',
@@ -383,7 +381,7 @@ export default async function userRoutes(server: FastifyInstance) {
       });
 
     } catch (error: any) {
-      request.log.error(error, 'Failed to delete user data');
+      request.log.error({ err: error }, 'Failed to delete user data');
       return reply.status(500).send({ 
         error: 'Failed to delete user data.', 
         details: error.message 
@@ -427,7 +425,7 @@ export default async function userRoutes(server: FastifyInstance) {
       reply.send(csv);
 
     } catch (error) {
-      request.log.error(error, 'Failed to export user receipts to CSV');
+      request.log.error({ err: error as any }, 'Failed to export user receipts to CSV');
       reply.status(500).send({ error: 'Could not export receipts to CSV.', details: error });
     }
   });

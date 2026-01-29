@@ -24,4 +24,6 @@ export const receiptProcessingQueue = new Queue('receipt-processing', {
 export interface ReceiptJobData {
   uploadId: number;
   imagePath: string;
+  receiptId?: number;
+  receiptImagePath?: string;
 }

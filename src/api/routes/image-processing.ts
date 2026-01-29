@@ -4,7 +4,8 @@ import { receiptProcessingQueue, ReceiptJobData } from '../../queue/index.js';
 import { db } from '../../db/index.js';
 import { receiptUploads, receipts, lineItems, processingErrors } from '../../db/schema.js';
 import { eq } from 'drizzle-orm';
-import { saveFile } from '../../utils/file-utils.js';
+import { saveFile, UPLOADS_DIR } from '../../utils/file-utils.js';
+import path from 'path';
 
 export default async function imageProcessingRoutes(server: FastifyInstance) {
 
@@ -114,8 +115,12 @@ export default async function imageProcessingRoutes(server: FastifyInstance) {
       },
 
       // Status message
-      message: upload.status === 'processing' 
-        ? `Processing in progress. ${processingCount} receipts still being processed.`
+      message: upload.status === 'processing'
+        ? totalDetected === 0
+          ? 'Detecting receipts in image...'
+          : processingCount > 0
+          ? `Analyzing receipts. ${successfulCount + failedCount} of ${totalDetected} done, ${processingCount} remaining.`
+          : `Finalizing processing for ${totalDetected} receipt${totalDetected !== 1 ? 's' : ''}.`
         : upload.status === 'completed'
         ? `Processing complete. ${successfulCount} succeeded, ${failedCount} failed.`
         : upload.status === 'partly_completed'
@@ -242,6 +247,100 @@ export default async function imageProcessingRoutes(server: FastifyInstance) {
     });
   });
 
+  // POST endpoint to re-trigger processing for a single receipt
+  server.post('/receipts/:uploadId/receipt/:receiptId/reprocess', { preHandler: [authenticate] }, async (request, reply) => {
+    if (!request.user) {
+      return reply.status(401).send({ error: 'User not authenticated.' });
+    }
+
+    const { uploadId, receiptId } = request.params as { uploadId: string; receiptId: string };
+    const uploadIdNum = parseInt(uploadId, 10);
+    const receiptIdNum = parseInt(receiptId, 10);
+
+    if (isNaN(uploadIdNum) || isNaN(receiptIdNum)) {
+      return reply.status(400).send({ error: 'Invalid upload ID or receipt ID.' });
+    }
+
+    const [upload] = await db
+      .select()
+      .from(receiptUploads)
+      .where(eq(receiptUploads.id, uploadIdNum));
+
+    if (!upload) {
+      return reply.status(404).send({ error: 'Receipt upload not found.' });
+    }
+
+    if (upload.userId !== request.user.id) {
+      return reply.status(403).send({ error: 'Forbidden.' });
+    }
+
+    const [receipt] = await db
+      .select()
+      .from(receipts)
+      .where(eq(receipts.id, receiptIdNum));
+
+    if (!receipt || receipt.uploadId !== uploadIdNum) {
+      return reply.status(404).send({ error: 'Receipt not found for this upload.' });
+    }
+
+    // Delete line items for this receipt
+    await db.delete(lineItems).where(eq(lineItems.receiptId, receiptIdNum));
+
+    // Delete processing errors for this receipt
+    const existingErrors = await db
+      .select()
+      .from(processingErrors)
+      .where(eq(processingErrors.uploadId, uploadIdNum));
+
+    for (const error of existingErrors) {
+      if (error.receiptId === receiptIdNum) {
+        await db.delete(processingErrors).where(eq(processingErrors.id, error.id));
+      }
+    }
+
+    // Reset receipt status to pending
+    await db
+      .update(receipts)
+      .set({
+        status: 'pending',
+        storeName: null,
+        totalAmount: null,
+        taxAmount: null,
+        transactionDate: null,
+        currency: null,
+        keywords: null,
+        isDuplicate: false,
+        duplicateOfReceiptId: null,
+        duplicateConfidenceScore: null,
+        duplicateCheckedAt: null,
+        duplicateOverride: false,
+      })
+      .where(eq(receipts.id, receiptIdNum));
+
+    // Update upload status to processing
+    await db
+      .update(receiptUploads)
+      .set({ status: 'processing', updatedAt: new Date() })
+      .where(eq(receiptUploads.id, uploadIdNum));
+
+    // Queue reprocessing job for the single receipt
+    const receiptFilename = receipt.imageUrl ? path.basename(receipt.imageUrl) : '';
+    const jobData: ReceiptJobData = {
+      uploadId: uploadIdNum,
+      imagePath: path.join(UPLOADS_DIR, filename),
+      receiptId: receiptIdNum,
+      receiptImagePath: receiptFilename ? path.join(UPLOADS_DIR, receiptFilename) : '',
+    };
+    await receiptProcessingQueue.add('process-single-receipt', jobData);
+
+    return reply.status(202).send({
+      uploadId: uploadIdNum,
+      receiptId: receiptIdNum,
+      message: 'Single receipt reprocessing has been queued.',
+      statusUrl: `/receipts/${uploadIdNum}/receipt/${receiptIdNum}`,
+    });
+  });
+
   // POST endpoint to re-trigger processing for an existing upload
   server.post('/receipts/:uploadId/reprocess', { preHandler: [authenticate] }, async (request, reply) => {
     if (!request.user) {
@@ -270,9 +369,10 @@ export default async function imageProcessingRoutes(server: FastifyInstance) {
       return reply.status(403).send({ error: 'Forbidden.' });
     }
 
-    // Extract the file path from the original image URL
-    // Assuming the URL format is like: /uploads/filename.jpg
-    const imagePath = upload.originalImageUrl.replace(/^\//, ''); // Remove leading slash if present
+    // Extract filename from public URL (e.g. "/files/abc123.jpg" → "abc123.jpg")
+    // and resolve to actual filesystem path in the uploads directory
+    const filename = path.basename(upload.originalImageUrl);
+    const imagePath = path.join(UPLOADS_DIR, filename);
 
     // Delete existing receipts and line items for this upload
     const existingReceipts = await db

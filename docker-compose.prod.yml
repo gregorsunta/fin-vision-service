@@ -1,27 +1,47 @@
 # docker-compose.prod.yml
 # ------------------------------------
-# This file provides override configurations for PRODUCTION.
+# Production configuration.
+# Databases (MySQL, Redis) run directly on the host, not in Docker.
 #
 # USAGE:
-# 1. Edit the host paths (e.g., '/srv/fin-vision-data/mysql') to your desired locations.
-# 2. Ensure the directories on the host exist and have the correct permissions.
-# 3. Deploy using: docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
-#
-version: '3.9'
+#   docker compose -f docker-compose.prod.yml up -d
 
 services:
   api:
+    build:
+      context: .
+      target: production
+    command: node dist/api/index.js
+    env_file: .env
+    environment:
+      - NODE_ENV=production
+    ports:
+      - "${API_PORT:-3000}:3000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
-      # Mounts a specific host directory for file uploads.
-      - /srv/fin-vision-data/uploads:/app/uploads
+      - ./uploads:/app/uploads
+    depends_on:
+      - worker
+    restart: always
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
-  mysql:
+  worker:
+    build:
+      context: .
+      target: production
+    command: node dist/workers/index.js
+    env_file: .env
+    environment:
+      - NODE_ENV=production
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-credentials.json
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
-      # Mounts a specific host directory into the container.
-      # The host path '/srv/fin-vision-data/mysql' is an example; change it to your preference.
-      - /srv/fin-vision-data/mysql:/var/lib/mysql
-  
-  redis:
-    volumes:
-      # Mounts a specific host directory for Redis data.
-      - /srv/fin-vision-data/redis:/data
+      - ./${GOOGLE_APPLICATION_CREDENTIALS:-gcp-credentials.json}:/app/gcp-credentials.json:ro
+      - ./logs:/app/logs
+    restart: always

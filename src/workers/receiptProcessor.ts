@@ -1,4 +1,4 @@
-import { Job, Worker } from 'bullmq';
+import { Worker } from 'bullmq';
 import { eq } from 'drizzle-orm';
 import fs from 'fs/promises';
 import sharp from 'sharp';
@@ -13,13 +13,149 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
+async function processSingleReceipt(job: any, uploadId: number, receiptId: number, receiptImagePath: string) {
+    const [uploadJob] = await db.select().from(receiptUploads).where(eq(receiptUploads.id, uploadId));
+    if (!uploadJob) {
+        throw new Error(`Upload job ${uploadId} not found.`);
+    }
+
+    try {
+        let fullPath: string;
+        if (receiptImagePath.startsWith('/')) {
+            fullPath = receiptImagePath;
+        } else if (receiptImagePath.startsWith('uploads/')) {
+            fullPath = receiptImagePath;
+        } else {
+            fullPath = `uploads/${receiptImagePath}`;
+        }
+
+        console.log(`Job ${job.id}: Reading receipt image from: ${fullPath}`);
+        const receiptImageBuffer = await fs.readFile(fullPath);
+        await job.updateProgress(10);
+
+        const receiptAnalyzer = new ReceiptAnalysisService();
+
+        try {
+            const analysisResult = await receiptAnalyzer.analyzeReceipts([receiptImageBuffer]);
+            const extractedData = analysisResult[0];
+
+            if (!extractedData || !extractedData.total) {
+                throw new Error('Invalid or empty data returned from analysis.');
+            }
+
+            await db.update(receipts)
+                .set({
+                    status: 'processed',
+                    storeName: extractedData.merchantName,
+                    totalAmount: extractedData.total.toString(),
+                    taxAmount: extractedData.tax?.toString(),
+                    transactionDate: new Date(extractedData.transactionDate),
+                    currency: extractedData.currency || 'USD',
+                    keywords: extractedData.keywords,
+                })
+                .where(eq(receipts.id, receiptId));
+
+            if (extractedData.items && extractedData.items.length > 0) {
+                await db.insert(lineItems).values(
+                    extractedData.items.map(item => ({
+                        receiptId: receiptId,
+                        description: item.description,
+                        amount: item.quantity.toString(),
+                        unit: item.quantityUnit || 'pc',
+                        pricePerUnit: item.unitPrice.toString(),
+                        totalPrice: (item.lineTotal ?? 0).toString(),
+                        keywords: item.keywords,
+                        itemType: item.itemType || ((item.lineTotal ?? 0) < 0 ? 'discount' : 'product'),
+                        discountMetadata: item.discountMetadata || null,
+                        parentLineItemId: null,
+                    }))
+                );
+            }
+
+            if (extractedData.validationIssues && extractedData.validationIssues.length > 0) {
+                for (const issue of extractedData.validationIssues) {
+                    await db.insert(processingErrors).values({
+                        uploadId: uploadId,
+                        receiptId: receiptId,
+                        category: 'VALIDATION_WARNING',
+                        message: `${issue.type}: ${issue.message}`,
+                        metadata: {
+                            severity: issue.severity,
+                            type: issue.type,
+                            details: issue.details,
+                        },
+                    });
+                }
+            }
+
+            console.log(`Job ${job.id}: Single receipt ${receiptId} processed successfully. Checking for duplicates...`);
+            const duplicateCheck = await checkForDuplicates(receiptId, uploadJob.userId);
+            if (duplicateCheck.isDuplicate && duplicateCheck.matchedReceipt) {
+                await markReceiptAsDuplicate(receiptId, duplicateCheck.matchedReceipt.id, duplicateCheck.confidenceScore);
+            }
+        } catch (err: any) {
+            console.error(`Job ${job.id}: Error processing single receipt ${receiptId}:`, err);
+            await db.update(receipts).set({ status: 'failed' }).where(eq(receipts.id, receiptId));
+            await db.insert(processingErrors).values({
+                uploadId: uploadId,
+                receiptId: receiptId,
+                category: 'EXTRACTION_FAILURE',
+                message: err.message || 'An unknown error occurred during analysis.',
+                metadata: { stack: err.stack },
+            });
+        }
+
+        // Recalculate upload status based on all receipts
+        const allReceipts = await db.select().from(receipts).where(eq(receipts.uploadId, uploadId));
+        const allProcessed = allReceipts.every(r => r.status === 'processed');
+        const allFailed = allReceipts.every(r => r.status === 'failed' || r.status === 'unreadable');
+        const hasPending = allReceipts.some(r => r.status === 'pending');
+
+        let finalStatus: 'processing' | 'completed' | 'partly_completed' | 'failed';
+        if (hasPending) {
+            finalStatus = 'processing';
+        } else if (allProcessed) {
+            finalStatus = 'completed';
+        } else if (allFailed) {
+            finalStatus = 'failed';
+        } else {
+            finalStatus = 'partly_completed';
+        }
+
+        await db.update(receiptUploads).set({ status: finalStatus }).where(eq(receiptUploads.id, uploadId));
+        await job.updateProgress(100);
+        console.log(`Job ${job.id}: Single receipt reprocessing finished. Upload status: ${finalStatus}`);
+
+    } catch (err: any) {
+        console.error(`Job ${job.id} (Single receipt ${receiptId}) failed critically:`, err);
+        await db.update(receipts).set({ status: 'failed' }).where(eq(receipts.id, receiptId));
+
+        // Recalculate upload status
+        const allReceipts = await db.select().from(receipts).where(eq(receipts.uploadId, uploadId));
+        const allFailed = allReceipts.every(r => r.status === 'failed' || r.status === 'unreadable');
+        await db.update(receiptUploads)
+            .set({ status: allFailed ? 'failed' : 'partly_completed' })
+            .where(eq(receiptUploads.id, uploadId));
+
+        throw err;
+    }
+}
+
 const connection = {
     host: process.env.REDIS_HOST || '127.0.0.1',
     port: Number(process.env.REDIS_PORT) || 6379,
 };
 
 const receiptProcessorWorker = new Worker<ReceiptJobData>('receipt-processing', async (job) => {
-    const { uploadId, imagePath } = job.data;
+    const { uploadId, imagePath, receiptId, receiptImagePath } = job.data;
+
+    // Handle single receipt reprocessing
+    if (receiptId && receiptImagePath) {
+        console.log(`Processing single receipt job ${job.id} for receipt ${receiptId} (upload ${uploadId})`);
+        await processSingleReceipt(job, uploadId, receiptId, receiptImagePath);
+        return;
+    }
+
     console.log(`Processing job ${job.id} for upload ${uploadId}`);
 
     const [uploadJob] = await db.select().from(receiptUploads).where(eq(receiptUploads.id, uploadId));
@@ -76,7 +212,8 @@ const receiptProcessorWorker = new Worker<ReceiptJobData>('receipt-processing', 
                 return `<rect x="${left}" y="${top}" width="${rectWidth}" height="${rectHeight}" stroke="red" stroke-width="5" fill="none"/>`;
             });
             const svgOverlay = `<svg width="${width}" height="${height}">${rects.join('')}</svg>`;
-            markedImageBuffer = await sharp(imageBuffer).composite([{ input: Buffer.from(svgOverlay), blend: 'over' }]).toBuffer();
+            const buffer = await sharp(imageBuffer).composite([{ input: Buffer.from(svgOverlay), blend: 'over' }]).toBuffer();
+            markedImageBuffer = Buffer.from(buffer);
         }
         const { publicUrl: markedImageUrl } = await saveFile(markedImageBuffer, `marked-${uploadId}.jpg`);
         await db.update(receiptUploads).set({ markedImageUrl }).where(eq(receiptUploads.id, uploadId));
@@ -128,8 +265,12 @@ const receiptProcessorWorker = new Worker<ReceiptJobData>('receipt-processing', 
                             description: item.description,
                             amount: item.quantity.toString(),
                             unit: item.quantityUnit || 'pc',
-                            totalPrice: item.price.toString(),
+                            pricePerUnit: item.unitPrice.toString(),
+                            totalPrice: (item.lineTotal ?? 0).toString(),
                             keywords: item.keywords,
+                            itemType: item.itemType || ((item.lineTotal ?? 0) < 0 ? 'discount' : 'product'),
+                            discountMetadata: item.discountMetadata || null,
+                            parentLineItemId: null,
                         }))
                     );
                 }

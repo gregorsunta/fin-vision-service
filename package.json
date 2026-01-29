@@ -7,7 +7,7 @@
   "scripts": {
     "dev:api": "nodemon --watch src --ext ts --exec \"tsx src/api/index.ts\"",
     "dev:worker": "nodemon --watch src --ext ts --exec \"tsx src/workers/index.ts\"",
-    "dev:all": "npm-run-all --parallel dev:api dev:worker",
+    "dev": "npm-run-all --parallel dev:api dev:worker",
     "build": "tsc",
     "build:watch": "tsc -w",
     "start:api": "node dist/api/index.js",

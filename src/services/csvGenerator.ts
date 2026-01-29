@@ -4,7 +4,9 @@ interface LineItem {
   id: number;
   description: string;
   quantity: string | null;
-  unitPrice: string;
+  unit: string | null;
+  pricePerUnit: string | null;
+  totalPrice: string;
 }
 
 interface Receipt {
@@ -31,7 +33,7 @@ export function generateReceiptsCsv(receipts: Receipt[]): string {
 
   const headers = [
     'Receipt ID', 'Store Name', 'Total Amount', 'Tax Amount', 'Transaction Date', 'Image URL',
-    'Line Item ID', 'Line Item Description', 'Line Item Quantity', 'Line Item Unit Price'
+    'Line Item ID', 'Line Item Description', 'Line Item Quantity', 'Line Item Unit', 'Line Item Unit Price', 'Line Item Total Price'
   ];
   let csvContent = headers.join(',') + '\n';
 
@@ -56,14 +58,15 @@ export function generateReceiptsCsv(receipts: Receipt[]): string {
           item.id,
           quote(item.description),
           quote(item.quantity),
-          quote(item.unitPrice)
+          quote(item.unit),
+          quote(item.pricePerUnit),
+          quote(item.totalPrice)
         ].join(',') + '\n';
       });
     } else {
-      // Handle receipts with no line items, still output the receipt info
       csvContent += [
         ...commonReceiptFields,
-        '', '', '', '' // Empty fields for line item details
+        '', '', '', '', '', '' // Empty fields for line item details
       ].join(',') + '\n';
     }
   });
