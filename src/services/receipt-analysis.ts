@@ -1,4 +1,5 @@
 import { GoogleGenerativeAI, Part } from '@google/generative-ai';
+import { ImageAnnotatorClient } from '@google-cloud/vision';
 
 // Updated structure to include keywords, quantity units, and item type
 export interface ReceiptItem {
@@ -41,6 +42,7 @@ export interface ReceiptData {
 
 export class ReceiptAnalysisService {
   private genAI: GoogleGenerativeAI;
+  private visionClient: ImageAnnotatorClient;
   private readonly GEMINI_API_KEY: string;
 
   constructor() {
@@ -49,6 +51,9 @@ export class ReceiptAnalysisService {
       throw new Error('GEMINI_API_KEY is not set in the environment variables');
     }
     this.genAI = new GoogleGenerativeAI(this.GEMINI_API_KEY);
+    this.visionClient = new ImageAnnotatorClient({
+      keyFilename: process.env.GCP_CREDENTIALS_PATH || './gcp-credentials.json',
+    });
   }
 
   /**
@@ -66,6 +71,8 @@ export class ReceiptAnalysisService {
 
     const model = this.genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
 
+    const ocrText = await this.extractTextWithVision(image);
+
     const imagePart: Part = {
       inlineData: {
         data: image.toString('base64'),
@@ -73,13 +80,76 @@ export class ReceiptAnalysisService {
       },
     };
 
-    const prompt = `
-      You are an expert receipt OCR and data extraction system. Your task is to analyze receipt images with EXTREME PRECISION.
+    const prompt = this.buildPrompt(ocrText);
+
+    try {
+      const result = await model.generateContent([prompt, imagePart]);
+      const responseText = result.response.text();
       
+      // Clean potential markdown fences - handle various formats Gemini might return
+      let cleanedText = responseText.trim();
+      // Remove markdown code blocks: ```json ... ``` or ```\n ... ```
+      cleanedText = cleanedText.replace(/^```(?:json)?\n?/gm, '');
+      cleanedText = cleanedText.replace(/\n?```$/gm, '');
+      cleanedText = cleanedText.trim();
+      
+      console.log('Gemini raw response (first 200 chars):', responseText.substring(0, 200));
+      console.log('Cleaned text (first 200 chars):', cleanedText.substring(0, 200));
+      
+      const analysisResult: ReceiptData = JSON.parse(cleanedText);
+
+      // Compute lineTotal from quantity × unitPrice in code
+      if (analysisResult.items) {
+        for (const item of analysisResult.items) {
+          item.lineTotal = Math.round(item.quantity * item.unitPrice * 100) / 100;
+        }
+      }
+
+      // Validate and log price discrepancies
+      this.validatePrices(analysisResult);
+      
+      // Return as an array to match the expected return type
+      return [analysisResult];
+    } catch (error) {
+      console.error('Error analyzing receipt with Gemini:', error);
+      throw new Error('Failed to analyze receipt. The model may have returned an invalid format.');
+    }
+  }
+
+  private async extractTextWithVision(image: Buffer): Promise<string | null> {
+    try {
+      const [result] = await this.visionClient.documentTextDetection({
+        image: { content: image },
+      });
+      const text = result.fullTextAnnotation?.text ?? null;
+      if (text) {
+        console.log(`Cloud Vision extracted ${text.length} characters of text.`);
+      }
+      return text;
+    } catch (error) {
+      console.warn('Cloud Vision OCR failed, falling back to image-only mode:', error);
+      return null;
+    }
+  }
+
+  private buildPrompt(ocrText: string | null): string {
+    const ocrSection = ocrText
+      ? `
+      === OCR TEXT FROM RECEIPT ===
+      ${ocrText}
+      === END OCR TEXT ===
+
+      You have been provided with OCR text extracted from the receipt above. Use this OCR text as the PRIMARY source for all numeric values (prices, quantities, totals). Use the image for understanding layout, structure, and any values the OCR may have missed.
+
+      `
+      : '';
+
+    return `${ocrSection}You are an expert receipt OCR and data extraction system. Your task is to analyze receipt images with EXTREME PRECISION.
+
       STEP 1: IMAGE QUALITY CHECK
       - If the image is too blurry, dark, or unreadable, return an empty JSON object: {}
       - Only proceed if you can confidently read all text
-      
+
       STEP 2: UNDERSTAND THE RECEIPT LAYOUT
       Most receipts follow this pattern:
       [Item Description] [Quantity/Weight] [Unit Price] [Total Line Price]
@@ -177,7 +247,7 @@ export class ReceiptAnalysisService {
       Format 6: Compact (numbers close together)
       Coca Cola 500ml  2  1.50  3.00
       → Extract: description="Coca Cola 500ml", quantity=2, unitPrice=1.50 (the per-unit price!)
-      
+
       IMPORTANT VALIDATION:
       - After extracting all items, compute each line total as quantity × unitPrice and sum them
       - The sum should equal the receipt TOTAL (not subtotal - item prices include tax)
@@ -188,17 +258,17 @@ export class ReceiptAnalysisService {
            or is it a multi-line format showing "N × unit_price = total"?
       - The number of output items should match the number of DISTINCT purchased products,
         not the number of physical lines on the receipt
-      
+
       WHAT TO IGNORE:
       - Product codes (e.g., "12345", "SKU-987")
       - Barcodes
       - Item numbers
       - Department codes
       - Running subtotals mid-receipt
-      
+
       ITEM TYPE CLASSIFICATION:
       Each line item must have an "itemType" field that identifies what kind of item it is:
-      
+
       - "product" - Regular purchased items (bread, milk, clothes, electronics, etc.)
       - "discount" - Price reductions, sales, coupons, loyalty discounts
       - "tax" - Tax lines (VAT, sales tax, etc.)
@@ -206,19 +276,19 @@ export class ReceiptAnalysisService {
       - "fee" - Service fees, delivery fees, processing fees
       - "refund" - Returns or refunds
       - "adjustment" - Other price adjustments
-      
+
       DISCOUNTS - IMPORTANT:
       When you see discount lines (e.g., "Popust 10%", "DISCOUNT -€2.00", "Rabatt", "Sale"), you MUST:
       1. Set itemType: "discount"
       2. Use negative unitPrice: unitPrice=-2.00 (discounts are always negative)
       3. Include discount metadata:
-         - If percentage discount (e.g., "10% off"): 
+         - If percentage discount (e.g., "10% off"):
            discountMetadata: { type: "percentage", value: 10 }
          - If fixed amount discount (e.g., "-€15"):
            discountMetadata: { type: "fixed", value: 15 }
          - If coupon/promo code is visible (e.g., "HSC Welcome", "SUMMER20"):
            discountMetadata: { type: "coupon", code: "HSC_WELCOME", value: 15 }
-      
+
       IMPORTANT: Slovenian receipts often use "Popust" for discounts - always mark these as itemType: "discount"
       - For 'quantityUnit', follow this CRITICAL logic:
         * FIRST: Check if the item description already contains a size/weight/volume (e.g., "500g", "1L", "250ml", "1.5kg", "330ml")
@@ -239,7 +309,7 @@ export class ReceiptAnalysisService {
       - If a value is not present, use null where allowed (subtotal, tax, quantityUnit).
       - Ensure all monetary values are numbers, not strings.
       - Include package sizes in the description when visible on the receipt (e.g., write "Coca Cola 500ml" not just "Coca Cola").
-      
+
       REQUIRED JSON STRUCTURE:
       {
         "merchantName": "Store Name",
@@ -266,24 +336,24 @@ export class ReceiptAnalysisService {
         "currency": "EUR",
         "keywords": ["groceries"]
       }
-      
+
       COMPLETE EXTRACTION EXAMPLE:
-      
+
       Receipt shows:
       ─────────────────────────────────────
       HERVIS Sports
       2026-01-07  15:45:00
-      
+
       HLACE M MARIO XL           €259.99
       Popust (10%)              -€26.00
       SMUČARSKA JAKNA M Bally   €114.99
       Popust (HSC Welcome)       -€15.00
-      
+
       SUBTOTAL                  €333.98
       TAX (22%)                  €73.48
       TOTAL                     €407.46
       ─────────────────────────────────────
-      
+
       Your JSON output:
       {
         "merchantName": "HERVIS Sports",
@@ -338,43 +408,10 @@ export class ReceiptAnalysisService {
         "currency": "EUR",
         "keywords": ["shopping", "sports", "clothing"]
       }
-      
+
       FINAL INSTRUCTION:
       Return ONLY the JSON object. No markdown, no explanation, no code fences. Just pure JSON.
     `;
-
-    try {
-      const result = await model.generateContent([prompt, imagePart]);
-      const responseText = result.response.text();
-      
-      // Clean potential markdown fences - handle various formats Gemini might return
-      let cleanedText = responseText.trim();
-      // Remove markdown code blocks: ```json ... ``` or ```\n ... ```
-      cleanedText = cleanedText.replace(/^```(?:json)?\n?/gm, '');
-      cleanedText = cleanedText.replace(/\n?```$/gm, '');
-      cleanedText = cleanedText.trim();
-      
-      console.log('Gemini raw response (first 200 chars):', responseText.substring(0, 200));
-      console.log('Cleaned text (first 200 chars):', cleanedText.substring(0, 200));
-      
-      const analysisResult: ReceiptData = JSON.parse(cleanedText);
-
-      // Compute lineTotal from quantity × unitPrice in code
-      if (analysisResult.items) {
-        for (const item of analysisResult.items) {
-          item.lineTotal = Math.round(item.quantity * item.unitPrice * 100) / 100;
-        }
-      }
-
-      // Validate and log price discrepancies
-      this.validatePrices(analysisResult);
-      
-      // Return as an array to match the expected return type
-      return [analysisResult];
-    } catch (error) {
-      console.error('Error analyzing receipt with Gemini:', error);
-      throw new Error('Failed to analyze receipt. The model may have returned an invalid format.');
-    }
   }
 
   /**
