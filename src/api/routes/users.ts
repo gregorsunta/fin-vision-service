@@ -6,7 +6,7 @@ import { authenticate } from '../auth.js';
 import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { generateReceiptsCsv } from '../../services/csvGenerator.js';
+import { generateReceiptsCsv, generateItemsCsv, generateUploadsCsv } from '../../services/csvGenerator.js';
 import {
   hashPassword,
   comparePasswords,
@@ -389,23 +389,56 @@ export default async function userRoutes(server: FastifyInstance) {
     }
   });
 
-  // Route to export all receipt data for the authenticated user as CSV
+  // Route to export receipt summaries as CSV (no line items)
   server.get('/users/me/receipts/export-csv', { preHandler: [authenticate] }, async (request, reply) => {
     if (!request.user) {
       return reply.status(401).send({ error: 'Authentication required.' });
     }
 
     try {
-      // Step 1: Find all upload IDs for the current user
       const userUploads = await db.select({ id: receiptUploads.id }).from(receiptUploads).where(eq(receiptUploads.userId, request.user.id));
-      
+
       if (userUploads.length === 0) {
         return reply.status(404).send({ message: 'No receipt uploads found for this user.' });
       }
 
       const uploadIds = userUploads.map(u => u.id);
 
-      // Step 2: Fetch all receipts associated with those upload IDs, along with their line items
+      const userReceipts: Receipt[] = await db.query.receipts.findMany({
+        where: inArray(receipts.uploadId, uploadIds),
+      });
+
+      if (!userReceipts || userReceipts.length === 0) {
+        return reply.status(404).send({ message: 'No processed receipts found for this user.' });
+      }
+
+      const csv = generateReceiptsCsv(userReceipts);
+
+      reply.header('Content-Type', 'text/csv');
+      reply.header('Content-Disposition', `attachment; filename="receipts_export.csv"`);
+      reply.send(csv);
+
+    } catch (error) {
+      request.log.error({ err: error as any }, 'Failed to export user receipts to CSV');
+      reply.status(500).send({ error: 'Could not export receipts to CSV.', details: error });
+    }
+  });
+
+  // Route to export all line items as CSV
+  server.get('/users/me/items/export-csv', { preHandler: [authenticate] }, async (request, reply) => {
+    if (!request.user) {
+      return reply.status(401).send({ error: 'Authentication required.' });
+    }
+
+    try {
+      const userUploads = await db.select({ id: receiptUploads.id }).from(receiptUploads).where(eq(receiptUploads.userId, request.user.id));
+
+      if (userUploads.length === 0) {
+        return reply.status(404).send({ message: 'No uploads found for this user.' });
+      }
+
+      const uploadIds = userUploads.map(u => u.id);
+
       const userReceipts: Receipt[] = await db.query.receipts.findMany({
         where: inArray(receipts.uploadId, uploadIds),
         with: {
@@ -414,19 +447,81 @@ export default async function userRoutes(server: FastifyInstance) {
       });
 
       if (!userReceipts || userReceipts.length === 0) {
-        return reply.status(404).send({ message: 'No processed receipts found for this user.' });
+        return reply.status(404).send({ message: 'No receipts found for this user.' });
       }
 
-      // Generate CSV from the fetched data
-      const csv = generateReceiptsCsv(userReceipts);
+      const csv = generateItemsCsv(userReceipts);
+
+      if (!csv) {
+        return reply.status(404).send({ message: 'No line items found for this user.' });
+      }
 
       reply.header('Content-Type', 'text/csv');
-      reply.header('Content-Disposition', `attachment; filename="user_${request.user.id}_receipts_export.csv"`);
+      reply.header('Content-Disposition', `attachment; filename="items_export.csv"`);
       reply.send(csv);
 
     } catch (error) {
-      request.log.error({ err: error as any }, 'Failed to export user receipts to CSV');
-      reply.status(500).send({ error: 'Could not export receipts to CSV.', details: error });
+      request.log.error({ err: error as any }, 'Failed to export user items to CSV');
+      reply.status(500).send({ error: 'Could not export items to CSV.', details: error });
+    }
+  });
+
+  // Route to export all uploads as CSV
+  server.get('/users/me/uploads/export-csv', { preHandler: [authenticate] }, async (request, reply) => {
+    if (!request.user) {
+      return reply.status(401).send({ error: 'Authentication required.' });
+    }
+
+    try {
+      const uploadsWithStats = await db
+        .select({
+          uploadId: receiptUploads.id,
+          originalImageUrl: receiptUploads.originalImageUrl,
+          status: receiptUploads.status,
+          createdAt: receiptUploads.createdAt,
+          updatedAt: receiptUploads.updatedAt,
+          totalReceipts: sql<number>`COALESCE(COUNT(${receipts.id}), 0)`,
+          successfulReceipts: sql<number>`COALESCE(SUM(CASE WHEN ${receipts.status} = 'processed' THEN 1 ELSE 0 END), 0)`,
+          failedReceipts: sql<number>`COALESCE(SUM(CASE WHEN ${receipts.status} IN ('failed', 'unreadable') THEN 1 ELSE 0 END), 0)`,
+          processingReceipts: sql<number>`COALESCE(SUM(CASE WHEN ${receipts.status} = 'pending' THEN 1 ELSE 0 END), 0)`,
+        })
+        .from(receiptUploads)
+        .leftJoin(receipts, eq(receipts.uploadId, receiptUploads.id))
+        .where(eq(receiptUploads.userId, request.user.id))
+        .groupBy(receiptUploads.id)
+        .orderBy(desc(receiptUploads.createdAt));
+
+      if (uploadsWithStats.length === 0) {
+        return reply.status(404).send({ message: 'No uploads found for this user.' });
+      }
+
+      const uploads = uploadsWithStats.map(u => {
+        const urlParts = u.originalImageUrl.split('/');
+        const fileName = urlParts[urlParts.length - 1] || 'unknown.jpg';
+        return {
+          uploadId: u.uploadId,
+          fileName,
+          status: u.status,
+          createdAt: u.createdAt,
+          updatedAt: u.updatedAt,
+          statistics: {
+            totalDetected: Number(u.totalReceipts),
+            successful: Number(u.successfulReceipts),
+            failed: Number(u.failedReceipts),
+            processing: Number(u.processingReceipts),
+          },
+        };
+      });
+
+      const csv = generateUploadsCsv(uploads);
+
+      reply.header('Content-Type', 'text/csv');
+      reply.header('Content-Disposition', `attachment; filename="uploads_export.csv"`);
+      reply.send(csv);
+
+    } catch (error) {
+      request.log.error({ err: error as any }, 'Failed to export user uploads to CSV');
+      reply.status(500).send({ error: 'Could not export uploads to CSV.', details: error });
     }
   });
 }

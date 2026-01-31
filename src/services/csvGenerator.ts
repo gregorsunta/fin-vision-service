@@ -2,74 +2,149 @@
 
 interface LineItem {
   id: number;
+  receiptId: number;
+  itemType: string;
   description: string;
-  quantity: string | null;
+  amount: string | null;
   unit: string | null;
   pricePerUnit: string | null;
   totalPrice: string;
+  keywords: string[] | null;
 }
 
 interface Receipt {
   id: number;
+  uploadId: number;
   storeName: string | null;
   totalAmount: string | null;
   taxAmount: string | null;
+  currency: string | null;
   transactionDate: Date | null;
-  imageUrl: string | null;
-  userId: number;
-  status: 'pending' | 'completed' | 'failed';
+  status: string;
+  keywords: string[] | null;
   lineItems: LineItem[];
 }
 
+interface Upload {
+  uploadId: number;
+  fileName: string;
+  status: string;
+  createdAt: Date | string;
+  updatedAt: Date | string;
+  statistics: {
+    totalDetected: number;
+    successful: number;
+    failed: number;
+    processing: number;
+  };
+}
+
+const doubleQuoteRegex = /"/g;
+const quote = (value: string | null | undefined) =>
+  `"${String(value || '').replace(doubleQuoteRegex, '""')}"`;
+
+function formatDate(date: Date | string | null): string {
+  if (!date) return '';
+  const d = date instanceof Date ? date : new Date(date);
+  return d.toISOString().split('T')[0];
+}
+
+function formatKeywords(keywords: string[] | null | undefined): string {
+  if (!keywords || !Array.isArray(keywords)) return '';
+  return keywords.join('; ');
+}
+
 /**
- * Generates a CSV string from an array of receipt data, including line items.
- * Each line item for a receipt will result in a separate row in the CSV,
- * with common receipt details repeated.
- * @param receipts An array of receipt objects, potentially including line items.
- * @returns A string containing the CSV data.
+ * One row per line item, with receipt context.
+ */
+export function generateItemsCsv(receipts: Receipt[]): string {
+  if (!receipts.length) return '';
+
+  const headers = [
+    'Item ID', 'Receipt ID', 'Upload ID', 'Store Name', 'Item Type',
+    'Description', 'Quantity', 'Unit', 'Price Per Unit', 'Total Price',
+    'Currency', 'Transaction Date', 'Keywords',
+  ];
+  let csv = headers.join(',') + '\n';
+
+  for (const receipt of receipts) {
+    if (!receipt.lineItems?.length) continue;
+    for (const item of receipt.lineItems) {
+      csv += [
+        item.id,
+        receipt.id,
+        receipt.uploadId,
+        quote(receipt.storeName),
+        quote(item.itemType),
+        quote(item.description),
+        quote(item.amount),
+        quote(item.unit),
+        quote(item.pricePerUnit),
+        quote(item.totalPrice),
+        quote(receipt.currency),
+        quote(formatDate(receipt.transactionDate)),
+        quote(formatKeywords(item.keywords)),
+      ].join(',') + '\n';
+    }
+  }
+
+  return csv;
+}
+
+/**
+ * One row per receipt, no line items.
  */
 export function generateReceiptsCsv(receipts: Receipt[]): string {
   if (!receipts.length) return '';
 
   const headers = [
-    'Receipt ID', 'Store Name', 'Total Amount', 'Tax Amount', 'Transaction Date', 'Image URL',
-    'Line Item ID', 'Line Item Description', 'Line Item Quantity', 'Line Item Unit', 'Line Item Unit Price', 'Line Item Total Price'
+    'Receipt ID', 'Upload ID', 'Store Name', 'Total Amount', 'Tax Amount',
+    'Currency', 'Transaction Date', 'Status', 'Keywords',
   ];
-  let csvContent = headers.join(',') + '\n';
+  let csv = headers.join(',') + '\n';
 
-  // Define the regex outside to avoid template literal parsing issues
-  const doubleQuoteRegex = /"/g;
-  const quote = (value: string | null | undefined) => `"${String(value || '').replace(doubleQuoteRegex, '""')}"`;
-
-  receipts.forEach(receipt => {
-    const commonReceiptFields = [
+  for (const receipt of receipts) {
+    csv += [
       receipt.id,
+      receipt.uploadId,
       quote(receipt.storeName),
       quote(receipt.totalAmount),
       quote(receipt.taxAmount),
-      quote(receipt.transactionDate ? receipt.transactionDate.toISOString().split('T')[0] : ''),
-      quote(receipt.imageUrl)
-    ];
+      quote(receipt.currency),
+      quote(formatDate(receipt.transactionDate)),
+      quote(receipt.status),
+      quote(formatKeywords(receipt.keywords)),
+    ].join(',') + '\n';
+  }
 
-    if (receipt.lineItems && receipt.lineItems.length > 0) {
-      receipt.lineItems.forEach(item => {
-        csvContent += [
-          ...commonReceiptFields,
-          item.id,
-          quote(item.description),
-          quote(item.quantity),
-          quote(item.unit),
-          quote(item.pricePerUnit),
-          quote(item.totalPrice)
-        ].join(',') + '\n';
-      });
-    } else {
-      csvContent += [
-        ...commonReceiptFields,
-        '', '', '', '', '', '' // Empty fields for line item details
-      ].join(',') + '\n';
-    }
-  });
+  return csv;
+}
 
-  return csvContent;
+/**
+ * One row per upload with aggregate statistics.
+ */
+export function generateUploadsCsv(uploads: Upload[]): string {
+  if (!uploads.length) return '';
+
+  const headers = [
+    'Upload ID', 'File Name', 'Status', 'Total Detected', 'Successful',
+    'Failed', 'Processing', 'Created At', 'Updated At',
+  ];
+  let csv = headers.join(',') + '\n';
+
+  for (const upload of uploads) {
+    csv += [
+      upload.uploadId,
+      quote(upload.fileName),
+      quote(upload.status),
+      upload.statistics.totalDetected,
+      upload.statistics.successful,
+      upload.statistics.failed,
+      upload.statistics.processing,
+      quote(formatDate(upload.createdAt)),
+      quote(formatDate(upload.updatedAt)),
+    ].join(',') + '\n';
+  }
+
+  return csv;
 }
