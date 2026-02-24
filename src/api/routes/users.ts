@@ -156,7 +156,7 @@ export default async function userRoutes(server: FastifyInstance) {
         ? queryParams.sortBy 
         : 'createdAt';
       const sortOrder = queryParams.sortOrder === 'asc' ? 'asc' : 'desc';
-      const statusFilter = queryParams.status && ['processing', 'completed', 'partly_completed', 'failed'].includes(queryParams.status)
+      const statusFilter = queryParams.status && ['processing', 'completed', 'partly_completed', 'failed', 'duplicate'].includes(queryParams.status)
         ? queryParams.status
         : null;
 
@@ -177,6 +177,7 @@ export default async function userRoutes(server: FastifyInstance) {
       const uploadsWithStats = await db
         .select({
           uploadId: receiptUploads.id,
+          uploadNumber: receiptUploads.uploadNumber,
           originalImageUrl: receiptUploads.originalImageUrl,
           markedImageUrl: receiptUploads.markedImageUrl,
           status: receiptUploads.status,
@@ -187,6 +188,13 @@ export default async function userRoutes(server: FastifyInstance) {
           successfulReceipts: sql<number>`COALESCE(SUM(CASE WHEN ${receipts.status} = 'processed' THEN 1 ELSE 0 END), 0)`,
           failedReceipts: sql<number>`COALESCE(SUM(CASE WHEN ${receipts.status} IN ('failed', 'unreadable') THEN 1 ELSE 0 END), 0)`,
           processingReceipts: sql<number>`COALESCE(SUM(CASE WHEN ${receipts.status} = 'pending' THEN 1 ELSE 0 END), 0)`,
+          needsReviewReceipts: sql<number>`COALESCE((
+            SELECT COUNT(DISTINCT pe.receipt_id)
+            FROM processing_errors pe
+            INNER JOIN receipts r2 ON r2.id = pe.receipt_id
+            WHERE r2.upload_id = ${receiptUploads.id}
+            AND pe.category = 'VALIDATION_WARNING'
+          ), 0)`,
         })
         .from(receiptUploads)
         .leftJoin(receipts, eq(receipts.uploadId, receiptUploads.id))
@@ -211,6 +219,7 @@ export default async function userRoutes(server: FastifyInstance) {
 
         return {
           uploadId: upload.uploadId,
+          uploadNumber: upload.uploadNumber,
           fileName: fileName,
           status: upload.status,
           hasReceipts: upload.hasReceipts === 1,
@@ -221,6 +230,7 @@ export default async function userRoutes(server: FastifyInstance) {
             successful: Number(upload.successfulReceipts),
             failed: Number(upload.failedReceipts),
             processing: Number(upload.processingReceipts),
+            needsReview: Number(upload.needsReviewReceipts),
           },
           images: {
             original: upload.originalImageUrl,

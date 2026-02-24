@@ -122,24 +122,38 @@ function calculateTotalAmountScore(amount1: string | null, amount2: string | nul
   return { score, difference: Math.round(difference * 100) / 100 };
 }
 
-// Calculate date matching score (0-20 points)
-function calculateDateScore(date1: Date | null, date2: Date | null): { score: number; daysDifference: number } {
-  if (!date1 || !date2) return { score: 0, daysDifference: 0 };
-  
+// Calculate date matching score (0-20 points), now time-aware
+function calculateDateScore(date1: Date | null, date2: Date | null): { score: number; daysDifference: number; sameTimeWindow: boolean } {
+  if (!date1 || !date2) return { score: 0, daysDifference: 0, sameTimeWindow: false };
+
   const time1 = date1.getTime();
   const time2 = date2.getTime();
+  const minutesDiff = Math.abs(time1 - time2) / (1000 * 60);
   const daysDiff = Math.abs(Math.floor((time1 - time2) / (1000 * 60 * 60 * 24)));
-  
+
+  const hasTime1 = date1.getHours() !== 0 || date1.getMinutes() !== 0;
+  const hasTime2 = date2.getHours() !== 0 || date2.getMinutes() !== 0;
+  const bothHaveTime = hasTime1 && hasTime2;
+
   let score = 0;
+  let sameTimeWindow = false;
+
   if (daysDiff === 0) {
-    score = 20;
+    if (bothHaveTime && minutesDiff <= 5) {
+      score = 20;
+      sameTimeWindow = true;
+    } else if (bothHaveTime && minutesDiff <= 60) {
+      score = 17;
+    } else {
+      score = 12;
+    }
   } else if (daysDiff === 1) {
-    score = 15; // Could be OCR error
-  } else if (daysDiff === 2 || daysDiff === 3) {
-    score = 10;
+    score = 8;
+  } else if (daysDiff <= 3) {
+    score = 4;
   }
-  
-  return { score, daysDifference: daysDiff };
+
+  return { score, daysDifference: daysDiff, sameTimeWindow };
 }
 
 // Calculate item count matching score (0-15 points)
@@ -260,9 +274,8 @@ export async function checkForDuplicates(receiptId: number, userId: number): Pro
     const endDate = new Date(dateFilter);
     endDate.setDate(endDate.getDate() + 3);
     
-    // Use SQL for date comparison since it's stored as date type
-    conditions.push(sql`${receipts.transactionDate} >= ${startDate.toISOString().split('T')[0]}`);
-    conditions.push(sql`${receipts.transactionDate} <= ${endDate.toISOString().split('T')[0]}`);
+    conditions.push(sql`${receipts.transactionDate} >= ${startDate.toISOString().slice(0, 19).replace('T', ' ')}`);
+    conditions.push(sql`${receipts.transactionDate} <= ${endDate.toISOString().slice(0, 19).replace('T', ' ')}`);
   }
 
   // Find candidate receipts
@@ -281,7 +294,7 @@ export async function checkForDuplicates(receiptId: number, userId: number): Pro
     };
   }
 
-  // Step 2: Calculate confidence scores for each candidate
+  // Step 2: Deterministic match shortcut + fuzzy scoring
   let bestMatch: any = null;
   let highestScore = 0;
   let bestMatchFactors: any = null;
@@ -321,6 +334,47 @@ export async function checkForDuplicates(receiptId: number, userId: number): Pro
       currentReceipt.taxAmount,
       candidateReceipt.taxAmount
     );
+
+    // Deterministic match: all four key factors align → definite duplicate
+    // If both receipts have time info, they must be within ±5min. Otherwise same day is enough.
+    const bothHaveTime = (currentReceipt.transactionDate?.getHours() !== 0 || currentReceipt.transactionDate?.getMinutes() !== 0) &&
+                         (candidateReceipt.transactionDate?.getHours() !== 0 || candidateReceipt.transactionDate?.getMinutes() !== 0);
+    const timeConditionMet = !bothHaveTime || dateMatch.sameTimeWindow;
+
+    const isDeterministicMatch =
+      storeNameMatch.similarity >= 90 &&
+      totalAmountMatch.difference <= 0.01 &&
+      dateMatch.daysDifference === 0 &&
+      timeConditionMet &&
+      itemCountMatch.difference === 0;
+
+    if (isDeterministicMatch) {
+      const deterministicFactors = {
+        storeName: storeNameMatch,
+        totalAmount: totalAmountMatch,
+        date: dateMatch,
+        itemCount: itemCountMatch,
+        taxAmount: taxAmountMatch,
+        deterministicMatch: true,
+      };
+
+      // Store match in DB and return immediately
+      await db.insert(duplicateMatches).values({
+        receiptId: receiptId,
+        potentialDuplicateId: candidateReceipt.id,
+        confidenceScore: '99.00',
+        matchFactors: deterministicFactors,
+        userAction: 'pending',
+      });
+
+      return {
+        isDuplicate: true,
+        confidenceScore: 99,
+        confidenceLevel: 'DEFINITE_DUPLICATE',
+        matchedReceipt: candidateReceipt,
+        matchFactors: deterministicFactors,
+      };
+    }
 
     // Calculate total confidence score
     const totalScore =

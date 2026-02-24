@@ -4,7 +4,7 @@ import {
   varchar,
   serial,
   decimal,
-  date,
+  datetime,
   mysqlEnum,
   int,
   text,
@@ -28,12 +28,23 @@ export const users = mysqlTable('users', {
 export const receiptUploads = mysqlTable('receipt_uploads', {
   id: serial('id').primaryKey(),
   userId: int('user_id').notNull(),
+  uploadNumber: int('upload_number').notNull(),
   originalImageUrl: varchar('original_image_url', { length: 2048 }).notNull(),
   markedImageUrl: varchar('marked_image_url', { length: 2048 }),
-  status: mysqlEnum('status', ['processing', 'completed', 'partly_completed', 'failed'])
+  imageHash: varchar('image_hash', { length: 64 }),
+  status: mysqlEnum('status', ['processing', 'completed', 'partly_completed', 'failed', 'duplicate'])
     .default('processing')
     .notNull(),
   hasReceipts: tinyint('has_receipts'),
+  splitMetadata: json('split_metadata').$type<{
+    rawResponse: string;
+    rawBoundingBoxes: { x: number; y: number; width: number; height: number }[];
+    mergedBoundingBoxes: { x: number; y: number; width: number; height: number }[];
+    provider: string;
+    model: string;
+    detectedCount: number;
+    mergedCount: number;
+  }>(),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().onUpdateNow().notNull(),
 });
@@ -68,14 +79,15 @@ export const receipts = mysqlTable('receipts', {
   // Increased precision for monetary values to handle different currencies and calculations more accurately.
   totalAmount: decimal('total_amount', { precision: 13, scale: 4 }),
   taxAmount: decimal('tax_amount', { precision: 13, scale: 4 }),
-  transactionDate: date('transaction_date'),
+  transactionDate: datetime('transaction_date'),
   // Enforcing ISO 4217 3-letter currency codes.
   currency: varchar('currency', { length: 3 }), // e.g., USD, EUR, GBP
   status: mysqlEnum('status', ['pending', 'processed', 'failed', 'unreadable'])
     .default('pending')
     .notNull(),
-  imageUrl: varchar('image_url', { length: 2048 }), // URL of the individual cropped receipt image
+  imageUrl: varchar('image_url', { length: 2048 }),
   keywords: json('keywords'),
+  category: varchar('category', { length: 50 }),
   
   // Duplicate detection fields
   isDuplicate: boolean('is_duplicate').default(false),
@@ -83,6 +95,15 @@ export const receipts = mysqlTable('receipts', {
   duplicateConfidenceScore: decimal('duplicate_confidence_score', { precision: 5, scale: 2 }), // 0-100
   duplicateCheckedAt: timestamp('duplicate_checked_at'),
   duplicateOverride: boolean('duplicate_override').default(false), // User confirmed not a duplicate
+
+  processingMetadata: json('processing_metadata').$type<{
+    ocrUsed: boolean;
+    ocrProvider?: string;
+    ocrCharCount?: number;
+    analysisModel: string;
+    analysisProvider?: string;
+    processedAt: string;
+  }>(),
 });
 
 export const lineItems = mysqlTable('line_items', {
@@ -122,6 +143,8 @@ export const lineItems = mysqlTable('line_items', {
   // Renaming to 'totalPrice' for clarity. A line item must have a total price.
   totalPrice: decimal('total_price', { precision: 13, scale: 4 }).notNull(),
   keywords: json('keywords'),
+  category: varchar('category', { length: 50 }),
+  subcategory: varchar('subcategory', { length: 50 }),
 });
 
 

@@ -1,14 +1,16 @@
-import { GoogleGenerativeAI, Part } from '@google/generative-ai';
 import { ImageAnnotatorClient } from '@google-cloud/vision';
+import { AIService, getAIService, AIGenerateResult } from '../ai/index.js';
+import { buildCategoryPromptList } from './categories.js';
 
-// Updated structure to include keywords, quantity units, and item type
 export interface ReceiptItem {
   description: string;
   quantity: number;
   quantityUnit?: string;
   unitPrice: number;
-  lineTotal?: number; // Computed after parsing: quantity × unitPrice
+  lineTotal?: number;
   keywords?: string[];
+  category?: string;
+  subcategory?: string;
 
   itemType?: 'product' | 'discount' | 'tax' | 'tip' | 'fee' | 'refund' | 'adjustment';
 
@@ -37,20 +39,23 @@ export interface ReceiptData {
   total: number;
   currency: string;
   keywords?: string[];
-  validationIssues?: ValidationIssue[]; // Added by validation
+  validationIssues?: ValidationIssue[];
+  processingMetadata?: {
+    ocrUsed: boolean;
+    ocrProvider?: string;
+    ocrCharCount?: number;
+    analysisModel: string;
+    analysisProvider?: string;
+    processedAt: string;
+  };
 }
 
 export class ReceiptAnalysisService {
-  private genAI: GoogleGenerativeAI;
+  private aiService: AIService;
   private visionClient: ImageAnnotatorClient;
-  private readonly GEMINI_API_KEY: string;
 
-  constructor() {
-    this.GEMINI_API_KEY = process.env.GEMINI_API_KEY!;
-    if (!this.GEMINI_API_KEY) {
-      throw new Error('GEMINI_API_KEY is not set in the environment variables');
-    }
-    this.genAI = new GoogleGenerativeAI(this.GEMINI_API_KEY);
+  constructor(aiService?: AIService) {
+    this.aiService = aiService || getAIService();
     this.visionClient = new ImageAnnotatorClient({
       keyFilename: process.env.GCP_CREDENTIALS_PATH || './gcp-credentials.json',
     });
@@ -69,33 +74,43 @@ export class ReceiptAnalysisService {
     // but we keep the array input to maintain a consistent interface and handle the single image.
     const image = images[0];
 
-    const model = this.genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
-
     const ocrText = await this.extractTextWithVision(image);
-
-    const imagePart: Part = {
-      inlineData: {
-        data: image.toString('base64'),
-        mimeType: 'image/jpeg',
-      },
-    };
-
     const prompt = this.buildPrompt(ocrText);
 
+    // When OCR succeeds, we can use text-only analysis (allows Groq fallback)
+    // When OCR fails, we need vision capability (Gemini only)
+    const requireVision = ocrText === null;
+
     try {
-      const result = await model.generateContent([prompt, imagePart]);
-      const responseText = result.response.text();
-      
-      // Clean potential markdown fences - handle various formats Gemini might return
+      let result: AIGenerateResult;
+
+      if (requireVision) {
+        // OCR failed - need vision capability, include the image
+        result = await this.aiService.generate({
+          prompt,
+          images: [{ data: image, mimeType: 'image/jpeg' }],
+          requireVision: true,
+        });
+      } else {
+        // OCR succeeded - can use text-only analysis (Groq fallback possible)
+        result = await this.aiService.generate({
+          prompt,
+          requireVision: false,
+        });
+      }
+
+      const responseText = result.text;
+
+      // Clean potential markdown fences - handle various formats the model might return
       let cleanedText = responseText.trim();
       // Remove markdown code blocks: ```json ... ``` or ```\n ... ```
       cleanedText = cleanedText.replace(/^```(?:json)?\n?/gm, '');
       cleanedText = cleanedText.replace(/\n?```$/gm, '');
       cleanedText = cleanedText.trim();
-      
-      console.log('Gemini raw response (first 200 chars):', responseText.substring(0, 200));
+
+      console.log(`${result.provider} raw response (first 200 chars):`, responseText.substring(0, 200));
       console.log('Cleaned text (first 200 chars):', cleanedText.substring(0, 200));
-      
+
       const analysisResult: ReceiptData = JSON.parse(cleanedText);
 
       // Compute lineTotal from quantity × unitPrice in code
@@ -107,11 +122,22 @@ export class ReceiptAnalysisService {
 
       // Validate and log price discrepancies
       this.validatePrices(analysisResult);
-      
+
+      analysisResult.processingMetadata = {
+        ocrUsed: ocrText !== null,
+        ...(ocrText !== null && {
+          ocrProvider: 'google_cloud_vision',
+          ocrCharCount: ocrText.length,
+        }),
+        analysisModel: result.model,
+        analysisProvider: result.provider,
+        processedAt: new Date().toISOString(),
+      };
+
       // Return as an array to match the expected return type
       return [analysisResult];
     } catch (error) {
-      console.error('Error analyzing receipt with Gemini:', error);
+      console.error('Error analyzing receipt:', error);
       throw new Error('Failed to analyze receipt. The model may have returned an invalid format.');
     }
   }
@@ -305,7 +331,10 @@ export class ReceiptAnalysisService {
             - "Fresh tomatoes" → quantity: 0.5, quantityUnit: "kg" (bulk/self-serve)
         * Common patterns that indicate packaged items: "500g", "1L", "250ml", "1.5kg", "330ml", "750ml", "2L", "100g"
       - For 'keywords' at the root level, provide general categories for the overall purchase (e.g., "groceries", "electronics", "dinner").
-      - For 'keywords' at the item level, provide specific categories for each item (e.g., "fruit", "vegetable", "beverage", "CPU").
+      - For 'keywords' at the item level, provide 2-3 descriptive keywords for the item (e.g., ["milk", "dairy"] or ["cola", "soft drink"]).
+      - For 'category' and 'subcategory' at the item level, assign from this list:
+      ${buildCategoryPromptList()}
+        Set 'category' to the main category id (e.g., "dairy-eggs") and 'subcategory' to the most specific matching subcategory id (e.g., "cheese"). If no subcategory fits, set subcategory to null. For discounts/tax/fee items, omit category.
       - If a value is not present, use null where allowed (subtotal, tax, quantityUnit).
       - Ensure all monetary values are numbers, not strings.
       - Include package sizes in the description when visible on the receipt (e.g., write "Coca Cola 500ml" not just "Coca Cola").
@@ -321,7 +350,9 @@ export class ReceiptAnalysisService {
             "quantity": 1.5,
             "quantityUnit": "pc" or "kg" or "g" or "L" or "ml",
             "unitPrice": 8.66,
-            "keywords": ["category1", "category2"],
+            "keywords": ["keyword1", "keyword2"],
+            "category": "category-id",
+            "subcategory": "subcategory-id",
             "itemType": "product" or "discount" or "tax" or "tip" or "fee",
             "discountMetadata": {
               "type": "percentage" or "fixed" or "coupon",
@@ -365,7 +396,9 @@ export class ReceiptAnalysisService {
             "quantity": 1,
             "quantityUnit": "pc",
             "unitPrice": 259.99,
-            "keywords": ["clothing", "pants"],
+            "keywords": ["pants", "clothing"],
+            "category": "clothing",
+            "subcategory": "clothes",
             "itemType": "product"
           },
           {
@@ -385,7 +418,9 @@ export class ReceiptAnalysisService {
             "quantity": 1,
             "quantityUnit": "pc",
             "unitPrice": 114.99,
-            "keywords": ["clothing", "jacket", "ski"],
+            "keywords": ["ski jacket", "outerwear"],
+            "category": "sports-outdoors",
+            "subcategory": "outdoor-gear",
             "itemType": "product"
           },
           {
@@ -406,7 +441,7 @@ export class ReceiptAnalysisService {
         "tax": 73.48,
         "total": 407.46,
         "currency": "EUR",
-        "keywords": ["shopping", "sports", "clothing"]
+        "keywords": ["sports equipment", "clothing", "shopping"]
       }
 
       FINAL INSTRUCTION:
@@ -433,8 +468,8 @@ export class ReceiptAnalysisService {
           type: 'PRICE_MISMATCH',
           message: `Sum of item prices (${calculatedTotal.toFixed(2)}) differs from receipt total (${receipt.total.toFixed(2)}) by ${diff.toFixed(2)}`,
           details: {
-            calculatedTotal: calculatedTotal.toFixed(2),
-            receiptTotal: receipt.total.toFixed(2),
+            calculatedSubtotal: calculatedTotal.toFixed(2),
+            receiptSubtotal: receipt.total.toFixed(2),
             difference: diff.toFixed(2),
             items: receipt.items.map(i => ({ description: i.description, lineTotal: i.lineTotal })),
           },

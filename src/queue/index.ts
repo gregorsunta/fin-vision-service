@@ -12,10 +12,10 @@ const connection = {
 export const receiptProcessingQueue = new Queue('receipt-processing', {
   connection,
   defaultJobOptions: {
-    attempts: 3, // Retry a job up to 3 times if it fails
+    attempts: 3,
     backoff: {
       type: 'exponential',
-      delay: 1000, // Start with a 1-second delay
+      delay: 30000, // 30s → 60s → 120s, gives rate limits time to recover
     },
   },
 });

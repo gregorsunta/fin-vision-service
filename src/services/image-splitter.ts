@@ -1,5 +1,5 @@
 import sharp from 'sharp';
-import { GoogleGenerativeAI, Part } from '@google/generative-ai';
+import { AIService, getAIService } from '../ai/index.js';
 
 interface BoundingBox {
   x: number;
@@ -13,48 +13,58 @@ interface GeminiDetection {
   label: string;
 }
 
-interface SplitImageOptions {
-  debug?: boolean;
+interface DetectionResult {
+  rawResponse: string;
+  rawBoundingBoxes: BoundingBox[];
+  mergedBoundingBoxes: BoundingBox[];
+  provider: string;
+  model: string;
 }
 
 interface SplitImageResult {
   images: Buffer[];
-  debug?: {
-    boundingBoxes: BoundingBox[];
-    geminiResponse?: any;
+  splitMetadata?: {
+    rawResponse: string;
+    rawBoundingBoxes: BoundingBox[];
+    mergedBoundingBoxes: BoundingBox[];
+    provider: string;
+    model: string;
+    detectedCount: number;
+    mergedCount: number;
   };
 }
 
 export class ImageSplitterService {
-  private genAI: GoogleGenerativeAI;
-  private readonly GEMINI_API_KEY: string;
+  private aiService: AIService;
 
-  constructor() {
-    this.GEMINI_API_KEY = process.env.GEMINI_API_KEY!;
-    if (!this.GEMINI_API_KEY) {
-      throw new Error('GEMINI_API_KEY is not set in the environment variables');
-    }
-    this.genAI = new GoogleGenerativeAI(this.GEMINI_API_KEY);
+  constructor(aiService?: AIService) {
+    this.aiService = aiService || getAIService();
   }
 
-  public async splitImage(imageBuffer: Buffer, options: SplitImageOptions = {}): Promise<SplitImageResult> {
-    const { debug = false } = options;
-
+  public async splitImage(imageBuffer: Buffer): Promise<SplitImageResult> {
     try {
-      const detectedBoundingBoxes = await this.callGeminiForBoundingBoxes(imageBuffer);
+      // Normalize EXIF orientation so dimensions and pixel coordinates are consistent
+      imageBuffer = Buffer.from(await sharp(imageBuffer).rotate().toBuffer());
+
+      const detection = await this.detectBoundingBoxes(imageBuffer);
 
       const result: SplitImageResult = {
         images: [],
+        splitMetadata: {
+          rawResponse: detection.rawResponse,
+          rawBoundingBoxes: detection.rawBoundingBoxes,
+          mergedBoundingBoxes: detection.mergedBoundingBoxes,
+          provider: detection.provider,
+          model: detection.model,
+          detectedCount: detection.rawBoundingBoxes.length,
+          mergedCount: detection.mergedBoundingBoxes.length,
+        },
       };
 
-      if (debug) {
-        result.debug = {
-          boundingBoxes: detectedBoundingBoxes,
-        };
-      }
+      const detectedBoundingBoxes = detection.mergedBoundingBoxes;
 
       if (detectedBoundingBoxes.length === 0) {
-        console.warn('Gemini did not detect any distinct receipts. Returning the original image.');
+        console.warn('AI did not detect any distinct receipts. Returning the original image.');
         result.images.push(imageBuffer);
         return result;
       }
@@ -114,24 +124,21 @@ export class ImageSplitterService {
     }
   }
 
-  private async callGeminiForBoundingBoxes(imageBuffer: Buffer): Promise<BoundingBox[]> {
-    const model = this.genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
-
-    const base64Image = imageBuffer.toString('base64');
+  private async detectBoundingBoxes(imageBuffer: Buffer): Promise<DetectionResult> {
     const mimeType = await this.detectMimeType(imageBuffer);
-    const imagePart: Part = {
-      inlineData: {
-        data: base64Image,
-        mimeType,
-      },
-    };
 
     const prompt = `Detect all individual receipts in this image. Return bounding boxes as a JSON array with labels. Never return masks or code fencing. If there are multiple receipts, detect each one separately.`;
 
     try {
-      const result = await model.generateContent([prompt, imagePart]);
-      let responseText = result.response.text();
-      console.log('Gemini raw response:', responseText);
+      const result = await this.aiService.generate({
+        prompt,
+        images: [{ data: imageBuffer, mimeType }],
+        requireVision: true,
+      });
+
+      const rawResponse = result.text;
+      let responseText = rawResponse;
+      console.log(`${result.provider} raw response:`, responseText);
 
       // Clean markdown code fences if present
       const jsonRegex = /```(?:json)?\n?([\s\S]*?)\n?```/;
@@ -145,7 +152,7 @@ export class ImageSplitterService {
       const detections: GeminiDetection[] = Array.isArray(parsed) ? parsed : [parsed];
 
       // Validate and convert from Gemini's native box_2d [y_min, x_min, y_max, x_max] to our BoundingBox format
-      const boundingBoxes: BoundingBox[] = detections
+      const rawBoundingBoxes: BoundingBox[] = detections
         .filter(d => d.box_2d && Array.isArray(d.box_2d) && d.box_2d.length === 4)
         .map(d => {
           const [yMin, xMin, yMax, xMax] = d.box_2d;
@@ -158,15 +165,88 @@ export class ImageSplitterService {
         })
         .filter(box => box.width > 0 && box.height > 0);
 
-      console.log(`Detected ${boundingBoxes.length} receipt(s) from Gemini response`);
-      return boundingBoxes;
-    } catch (error) {
-      console.error('Error calling Gemini API for bounding boxes. Original error:', error);
-      if (error instanceof SyntaxError && error.message.includes('JSON.parse')) {
-        console.error('Gemini did not return valid JSON. The raw response is logged above.');
+      console.log(`Detected ${rawBoundingBoxes.length} raw bounding box(es) from ${result.provider} response`);
+
+      const mergedBoundingBoxes = this.mergeOverlappingBoxes(rawBoundingBoxes);
+      if (mergedBoundingBoxes.length < rawBoundingBoxes.length) {
+        console.log(`Merged ${rawBoundingBoxes.length} boxes down to ${mergedBoundingBoxes.length} (removed overlapping duplicates)`);
       }
-      throw new Error('Failed to get bounding boxes from Gemini.');
+
+      return {
+        rawResponse,
+        rawBoundingBoxes,
+        mergedBoundingBoxes,
+        provider: result.provider,
+        model: result.model,
+      };
+    } catch (error) {
+      console.error('Error calling AI service for bounding boxes. Original error:', error);
+      if (error instanceof SyntaxError && error.message.includes('JSON.parse')) {
+        console.error('AI service did not return valid JSON. The raw response is logged above.');
+      }
+      throw new Error('Failed to get bounding boxes from AI service.');
     }
+  }
+
+  /**
+   * Merges bounding boxes that overlap significantly (IoU > threshold),
+   * preventing duplicate crops of the same receipt.
+   */
+  private mergeOverlappingBoxes(boxes: BoundingBox[], iouThreshold = 0.3): BoundingBox[] {
+    if (boxes.length <= 1) return boxes;
+
+    // Track which boxes have been merged into another
+    const merged = new Array<boolean>(boxes.length).fill(false);
+    const result: BoundingBox[] = [];
+
+    for (let i = 0; i < boxes.length; i++) {
+      if (merged[i]) continue;
+
+      let current = boxes[i];
+
+      for (let j = i + 1; j < boxes.length; j++) {
+        if (merged[j]) continue;
+
+        const iou = this.computeIoU(current, boxes[j]);
+        if (iou > iouThreshold) {
+          console.log(`Boxes ${i} and ${j} overlap (IoU=${iou.toFixed(2)}), merging`);
+          // Merge by taking the union (largest enclosing box)
+          current = this.unionBox(current, boxes[j]);
+          merged[j] = true;
+        }
+      }
+
+      result.push(current);
+    }
+
+    return result;
+  }
+
+  private computeIoU(a: BoundingBox, b: BoundingBox): number {
+    const x1 = Math.max(a.x, b.x);
+    const y1 = Math.max(a.y, b.y);
+    const x2 = Math.min(a.x + a.width, b.x + b.width);
+    const y2 = Math.min(a.y + a.height, b.y + b.height);
+
+    const intersectionWidth = Math.max(0, x2 - x1);
+    const intersectionHeight = Math.max(0, y2 - y1);
+    const intersection = intersectionWidth * intersectionHeight;
+
+    if (intersection === 0) return 0;
+
+    const areaA = a.width * a.height;
+    const areaB = b.width * b.height;
+    const union = areaA + areaB - intersection;
+
+    return intersection / union;
+  }
+
+  private unionBox(a: BoundingBox, b: BoundingBox): BoundingBox {
+    const x = Math.min(a.x, b.x);
+    const y = Math.min(a.y, b.y);
+    const x2 = Math.max(a.x + a.width, b.x + b.width);
+    const y2 = Math.max(a.y + a.height, b.y + b.height);
+    return { x, y, width: x2 - x, height: y2 - y };
   }
 
   private async detectMimeType(imageBuffer: Buffer): Promise<string> {

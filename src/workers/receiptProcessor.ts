@@ -8,10 +8,30 @@ import { ReceiptJobData } from '../queue/index.js';
 import { checkForDuplicates, markReceiptAsDuplicate } from '../services/duplicate-detector.js';
 import { ImageSplitterService } from '../services/image-splitter.js';
 import { ReceiptAnalysisService } from '../services/receipt-analysis.js';
-import { saveFile } from '../utils/file-utils.js';
+import { saveFile, compressToWebP, correctOrientation } from '../utils/file-utils.js';
+import { ReceiptItem } from '../services/receipt-analysis.js';
 import dotenv from 'dotenv';
 
 dotenv.config();
+
+function deriveReceiptCategory(items: ReceiptItem[]): string | null {
+    const counts = new Map<string, number>();
+    for (const item of items) {
+        if (item.category && item.itemType !== 'discount' && item.itemType !== 'tax') {
+            counts.set(item.category, (counts.get(item.category) || 0) + 1);
+        }
+    }
+    if (counts.size === 0) return null;
+    let best = '';
+    let bestCount = 0;
+    for (const [cat, count] of counts) {
+        if (count > bestCount) {
+            best = cat;
+            bestCount = count;
+        }
+    }
+    return best;
+}
 
 async function processSingleReceipt(job: any, uploadId: number, receiptId: number, receiptImagePath: string) {
     const [uploadJob] = await db.select().from(receiptUploads).where(eq(receiptUploads.id, uploadId));
@@ -43,15 +63,19 @@ async function processSingleReceipt(job: any, uploadId: number, receiptId: numbe
                 throw new Error('Invalid or empty data returned from analysis.');
             }
 
+            const receiptCategory = deriveReceiptCategory(extractedData.items);
+
             await db.update(receipts)
                 .set({
                     status: 'processed',
                     storeName: extractedData.merchantName,
                     totalAmount: extractedData.total.toString(),
                     taxAmount: extractedData.tax?.toString(),
-                    transactionDate: new Date(extractedData.transactionDate),
+                    transactionDate: new Date(`${extractedData.transactionDate}T${extractedData.transactionTime || '00:00:00'}`),
                     currency: extractedData.currency || 'USD',
                     keywords: extractedData.keywords,
+                    category: receiptCategory,
+                    processingMetadata: extractedData.processingMetadata,
                 })
                 .where(eq(receipts.id, receiptId));
 
@@ -65,6 +89,8 @@ async function processSingleReceipt(job: any, uploadId: number, receiptId: numbe
                         pricePerUnit: item.unitPrice.toString(),
                         totalPrice: (item.lineTotal ?? 0).toString(),
                         keywords: item.keywords,
+                        category: item.category || null,
+                        subcategory: item.subcategory || null,
                         itemType: item.itemType || ((item.lineTotal ?? 0) < 0 ? 'discount' : 'product'),
                         discountMetadata: item.discountMetadata || null,
                         parentLineItemId: null,
@@ -163,6 +189,11 @@ const receiptProcessorWorker = new Worker<ReceiptJobData>('receipt-processing', 
         throw new Error(`Upload job ${uploadId} not found.`);
     }
 
+    if (uploadJob.status === 'duplicate') {
+        console.log(`Job ${job.id}: Upload ${uploadId} is a duplicate — skipping processing.`);
+        return;
+    }
+
     try {
         // imagePath can be:
         // 1. Full absolute path: /Users/.../uploads/file.jpg (from initial upload)
@@ -182,13 +213,17 @@ const receiptProcessorWorker = new Worker<ReceiptJobData>('receipt-processing', 
         }
         
         console.log(`Job ${job.id}: Reading image from: ${fullImagePath}`);
-        const imageBuffer = await fs.readFile(fullImagePath);
+        const rawImageBuffer = await fs.readFile(fullImagePath);
+        // Normalize EXIF orientation, then correct content orientation for cases where
+        // EXIF is unreliable (e.g. phone held flat pointing downwards at receipts).
+        const exifNormalized = await sharp(rawImageBuffer).rotate().toBuffer();
+        const imageBuffer = await correctOrientation(exifNormalized);
 
         // 1. Split the image
         await job.updateProgress(5);
         console.log(`Job ${job.id}: Splitting image...`);
         const imageSplitter = new ImageSplitterService();
-        const splitResult = await imageSplitter.splitImage(imageBuffer, { debug: true });
+        const splitResult = await imageSplitter.splitImage(imageBuffer);
 
         if (splitResult.images.length === 0) {
             await db.update(receiptUploads).set({ status: 'completed', hasReceipts: 0 }).where(eq(receiptUploads.id, uploadId));
@@ -199,12 +234,12 @@ const receiptProcessorWorker = new Worker<ReceiptJobData>('receipt-processing', 
         
         await db.update(receiptUploads).set({ hasReceipts: 1 }).where(eq(receiptUploads.id, uploadId));
 
-        // 2. Create Marked Image
+        // 2. Save split metadata and create marked image
         await job.updateProgress(10);
         let markedImageBuffer = imageBuffer;
-        if (splitResult.debug?.boundingBoxes) {
+        if (splitResult.splitMetadata?.mergedBoundingBoxes) {
             const { width, height } = await sharp(imageBuffer).metadata();
-            const rects = splitResult.debug.boundingBoxes.map(box => {
+            const rects = splitResult.splitMetadata.mergedBoundingBoxes.map(box => {
                 const left = Math.round((box.x / 1000) * width!);
                 const top = Math.round((box.y / 1000) * height!);
                 const rectWidth = Math.round((box.width / 1000) * width!);
@@ -215,8 +250,12 @@ const receiptProcessorWorker = new Worker<ReceiptJobData>('receipt-processing', 
             const buffer = await sharp(imageBuffer).composite([{ input: Buffer.from(svgOverlay), blend: 'over' }]).toBuffer();
             markedImageBuffer = Buffer.from(buffer);
         }
-        const { publicUrl: markedImageUrl } = await saveFile(markedImageBuffer, `marked-${uploadId}.jpg`);
-        await db.update(receiptUploads).set({ markedImageUrl }).where(eq(receiptUploads.id, uploadId));
+        const compressedMarked = await compressToWebP(markedImageBuffer, 75);
+        const { publicUrl: markedImageUrl } = await saveFile(compressedMarked, `marked-${uploadId}.webp`);
+        await db.update(receiptUploads).set({
+            markedImageUrl,
+            splitMetadata: splitResult.splitMetadata ?? null,
+        }).where(eq(receiptUploads.id, uploadId));
 
         // 3. Process each receipt individually
         console.log(`Job ${job.id}: Found ${splitResult.images.length} receipts. Analyzing each...`);
@@ -229,7 +268,8 @@ const receiptProcessorWorker = new Worker<ReceiptJobData>('receipt-processing', 
             const progress = 15 + Math.round((i / totalReceipts) * 80);
             await job.updateProgress(progress);
             
-            const { publicUrl: receiptImageUrl } = await saveFile(receiptImageBuffer, `receipt-${uploadId}-${i}.jpg`);
+            const compressedReceipt = await compressToWebP(receiptImageBuffer);
+            const { publicUrl: receiptImageUrl } = await saveFile(compressedReceipt, `receipt-${uploadId}-${i}.webp`);
 
             const receiptInsertResult = await db.insert(receipts).values({
                 uploadId: uploadId,
@@ -246,15 +286,19 @@ const receiptProcessorWorker = new Worker<ReceiptJobData>('receipt-processing', 
                     throw new Error('Invalid or empty data returned from analysis.');
                 }
 
+                const receiptCategory = deriveReceiptCategory(extractedData.items);
+
                 await db.update(receipts)
                     .set({
                         status: 'processed',
                         storeName: extractedData.merchantName,
                         totalAmount: extractedData.total.toString(),
                         taxAmount: extractedData.tax?.toString(),
-                        transactionDate: new Date(extractedData.transactionDate),
+                        transactionDate: new Date(`${extractedData.transactionDate}T${extractedData.transactionTime || '00:00:00'}`),
                         currency: extractedData.currency || 'USD',
                         keywords: extractedData.keywords,
+                        category: receiptCategory,
+                        processingMetadata: extractedData.processingMetadata,
                     })
                     .where(eq(receipts.id, receiptRecordId));
 
@@ -268,6 +312,8 @@ const receiptProcessorWorker = new Worker<ReceiptJobData>('receipt-processing', 
                             pricePerUnit: item.unitPrice.toString(),
                             totalPrice: (item.lineTotal ?? 0).toString(),
                             keywords: item.keywords,
+                            category: item.category || null,
+                            subcategory: item.subcategory || null,
                             itemType: item.itemType || ((item.lineTotal ?? 0) < 0 ? 'discount' : 'product'),
                             discountMetadata: item.discountMetadata || null,
                             parentLineItemId: null,
