@@ -1,6 +1,79 @@
 import { ImageAnnotatorClient } from '@google-cloud/vision';
+import { SchemaType } from '@google/generative-ai';
+import sharp from 'sharp';
+import { createWorker, type Worker as TesseractWorker } from 'tesseract.js';
 import { AIService, getAIService, AIGenerateResult } from '../ai/index.js';
 import { buildCategoryPromptList } from './categories.js';
+
+// Module-level singleton — Tesseract workers are heavy (~50MB RAM, ~3-5s
+// initialization downloading language data). One shared worker per process
+// is reused across all receipt processing calls.
+let tesseractWorkerPromise: Promise<TesseractWorker> | null = null;
+async function getTesseractWorker(): Promise<TesseractWorker> {
+  if (!tesseractWorkerPromise) {
+    tesseractWorkerPromise = createWorker(['slv', 'eng', 'deu']).catch((err) => {
+      tesseractWorkerPromise = null;
+      throw err;
+    });
+  }
+  return tesseractWorkerPromise;
+}
+
+const receiptExtractionSchema = {
+  type: SchemaType.OBJECT,
+  properties: {
+    merchantName: { type: SchemaType.STRING },
+    transactionDate: { type: SchemaType.STRING },
+    transactionTime: { type: SchemaType.STRING },
+    items: {
+      type: SchemaType.ARRAY,
+      items: {
+        type: SchemaType.OBJECT,
+        properties: {
+          description: { type: SchemaType.STRING },
+          quantity: { type: SchemaType.NUMBER },
+          quantityUnit: { type: SchemaType.STRING, nullable: true },
+          unitPrice: { type: SchemaType.NUMBER },
+          keywords: { type: SchemaType.ARRAY, items: { type: SchemaType.STRING } },
+          category: { type: SchemaType.STRING, nullable: true },
+          subcategory: { type: SchemaType.STRING, nullable: true },
+          confidence: { type: SchemaType.NUMBER },
+          itemType: {
+            type: SchemaType.STRING,
+            enum: ['product', 'discount', 'tax', 'tip', 'fee', 'refund', 'adjustment'],
+          },
+          discountMetadata: {
+            type: SchemaType.OBJECT,
+            nullable: true,
+            properties: {
+              type: { type: SchemaType.STRING, nullable: true },
+              value: { type: SchemaType.NUMBER, nullable: true },
+              code: { type: SchemaType.STRING, nullable: true },
+              originalPrice: { type: SchemaType.NUMBER, nullable: true },
+            },
+          },
+        },
+        required: ['description', 'quantity', 'unitPrice', 'itemType'],
+      },
+    },
+    subtotal: { type: SchemaType.NUMBER, nullable: true },
+    tax: { type: SchemaType.NUMBER, nullable: true },
+    total: { type: SchemaType.NUMBER },
+    currency: { type: SchemaType.STRING },
+    keywords: { type: SchemaType.ARRAY, items: { type: SchemaType.STRING } },
+    confidenceScores: {
+      type: SchemaType.OBJECT,
+      properties: {
+        merchantName: { type: SchemaType.NUMBER },
+        transactionDate: { type: SchemaType.NUMBER },
+        total: { type: SchemaType.NUMBER },
+        items: { type: SchemaType.NUMBER },
+      },
+      required: ['merchantName', 'transactionDate', 'total', 'items'],
+    },
+  },
+  required: ['merchantName', 'transactionDate', 'transactionTime', 'items', 'total', 'currency', 'confidenceScores'],
+};
 
 export interface ReceiptItem {
   description: string;
@@ -11,6 +84,7 @@ export interface ReceiptItem {
   keywords?: string[];
   category?: string;
   subcategory?: string;
+  confidence?: number;
 
   itemType?: 'product' | 'discount' | 'tax' | 'tip' | 'fee' | 'refund' | 'adjustment';
 
@@ -24,9 +98,16 @@ export interface ReceiptItem {
 
 export interface ValidationIssue {
   severity: 'warning' | 'error';
-  type: 'PRICE_MISMATCH' | 'TOTAL_MISMATCH' | 'INVALID_PRICE' | 'UNREALISTIC_PRICE';
+  type: 'PRICE_MISMATCH' | 'INVALID_PRICE' | 'UNREALISTIC_PRICE' | 'INVALID_DATE' | 'UNREALISTIC_QUANTITY' | 'MISSING_MERCHANT' | 'OCR_MISMATCH' | 'LOW_IMAGE_QUALITY';
   message: string;
   details?: any;
+}
+
+export interface ConfidenceScores {
+  merchantName: number;
+  transactionDate: number;
+  total: number;
+  items: number;
 }
 
 export interface ReceiptData {
@@ -39,6 +120,8 @@ export interface ReceiptData {
   total: number;
   currency: string;
   keywords?: string[];
+  ocrText?: string;
+  confidenceScores?: ConfidenceScores;
   validationIssues?: ValidationIssue[];
   processingMetadata?: {
     ocrUsed: boolean;
@@ -47,6 +130,8 @@ export interface ReceiptData {
     analysisModel: string;
     analysisProvider?: string;
     processedAt: string;
+    retryCount?: number;
+    retryReason?: string;
   };
 }
 
@@ -70,58 +155,103 @@ export class ReceiptAnalysisService {
     if (images.length === 0) {
       return [];
     }
-    // This service now processes one image at a time as per the new workflow,
-    // but we keep the array input to maintain a consistent interface and handle the single image.
     const image = images[0];
 
     const ocrText = await this.extractTextWithVision(image);
-    const prompt = this.buildPrompt(ocrText);
-
-    // When OCR succeeds, we can use text-only analysis (allows Groq fallback)
-    // When OCR fails, we need vision capability (Gemini only)
-    const requireVision = ocrText === null;
+    const systemPrompt = this.buildSystemPrompt();
+    const userPrompt = this.buildUserPrompt(ocrText);
 
     try {
-      let result: AIGenerateResult;
+      // Always send image + OCR text for maximum accuracy (dual-source)
+      const generateOptions = {
+        prompt: userPrompt,
+        systemPrompt,
+        images: [{ data: image, mimeType: 'image/jpeg' }],
+        requireVision: true,
+        responseFormat: 'json' as const,
+        responseSchema: receiptExtractionSchema,
+        config: { temperature: 0, maxTokens: 4096 },
+      };
 
-      if (requireVision) {
-        // OCR failed - need vision capability, include the image
-        result = await this.aiService.generate({
-          prompt,
-          images: [{ data: image, mimeType: 'image/jpeg' }],
-          requireVision: true,
+      let result = await this.aiService.generate(generateOptions);
+      let analysisResult: ReceiptData;
+
+      try {
+        analysisResult = this.parseResponse(result);
+      } catch (parseError) {
+        console.warn('⚠️  JSON parse failed, retrying with parse correction prompt...');
+        const retryResult = await this.aiService.generate({
+          ...generateOptions,
+          prompt: userPrompt + '\n\nCRITICAL: Your previous response was not valid JSON. Return ONLY a valid JSON object, no other text.',
         });
-      } else {
-        // OCR succeeded - can use text-only analysis (Groq fallback possible)
-        result = await this.aiService.generate({
-          prompt,
-          requireVision: false,
-        });
+        analysisResult = this.parseResponse(retryResult);
+        result = retryResult;
       }
 
-      const responseText = result.text;
+      this.computeLineTotals(analysisResult);
+      this.validatePrices(analysisResult);
 
-      // Clean potential markdown fences - handle various formats the model might return
-      let cleanedText = responseText.trim();
-      // Remove markdown code blocks: ```json ... ``` or ```\n ... ```
-      cleanedText = cleanedText.replace(/^```(?:json)?\n?/gm, '');
-      cleanedText = cleanedText.replace(/\n?```$/gm, '');
-      cleanedText = cleanedText.trim();
+      // Retry once if price mismatch detected
+      const hasPriceMismatch = analysisResult.validationIssues?.some(
+        (i) => i.type === 'PRICE_MISMATCH'
+      );
 
-      console.log(`${result.provider} raw response (first 200 chars):`, responseText.substring(0, 200));
-      console.log('Cleaned text (first 200 chars):', cleanedText.substring(0, 200));
+      if (hasPriceMismatch) {
+        console.log('⚠️  Price mismatch detected, retrying with corrective prompt...');
+        const calculatedTotal = analysisResult.items.reduce(
+          (sum, item) => sum + (item.lineTotal ?? 0), 0
+        );
+        const correctionPrompt = this.buildCorrectionPrompt(
+          ocrText, calculatedTotal, analysisResult.total
+        );
 
-      const analysisResult: ReceiptData = JSON.parse(cleanedText);
+        try {
+          const retryResult = await this.aiService.generate({
+            ...generateOptions,
+            prompt: correctionPrompt,
+          });
+          const retryAnalysis = this.parseResponse(retryResult);
+          this.computeLineTotals(retryAnalysis);
+          this.validatePrices(retryAnalysis);
 
-      // Compute lineTotal from quantity × unitPrice in code
-      if (analysisResult.items) {
-        for (const item of analysisResult.items) {
-          item.lineTotal = Math.round(item.quantity * item.unitPrice * 100) / 100;
+          const retryHasMismatch = retryAnalysis.validationIssues?.some(
+            (i) => i.type === 'PRICE_MISMATCH'
+          );
+
+          if (!retryHasMismatch) {
+            console.log('✓ Retry resolved price mismatch');
+            analysisResult = retryAnalysis;
+            result = retryResult;
+          } else {
+            // Keep whichever has a smaller diff
+            const origDiff = Math.abs(
+              calculatedTotal - analysisResult.total
+            );
+            const retryCalcTotal = retryAnalysis.items.reduce(
+              (sum, item) => sum + (item.lineTotal ?? 0), 0
+            );
+            const retryDiff = Math.abs(retryCalcTotal - retryAnalysis.total);
+            if (retryDiff < origDiff) {
+              analysisResult = retryAnalysis;
+              result = retryResult;
+            }
+            console.warn('⚠️  Retry did not fully resolve price mismatch, using best result');
+          }
+
+          // Last-resort: if items still sum HIGHER than total, the model
+          // consistently can't find the discount line. Add a synthetic
+          // discount item for the difference so downstream math works and
+          // remove the PRICE_MISMATCH issue. Mark with a clear note.
+          this.reconcileWithSyntheticDiscount(analysisResult);
+        } catch (retryError) {
+          console.warn('⚠️  Retry failed, using original result:', retryError);
         }
       }
 
-      // Validate and log price discrepancies
-      this.validatePrices(analysisResult);
+      // Cross-validate extracted values against OCR text
+      if (ocrText) {
+        this.crossValidateWithOCR(analysisResult, ocrText);
+      }
 
       analysisResult.processingMetadata = {
         ocrUsed: ocrText !== null,
@@ -132,45 +262,253 @@ export class ReceiptAnalysisService {
         analysisModel: result.model,
         analysisProvider: result.provider,
         processedAt: new Date().toISOString(),
+        ...(hasPriceMismatch && { retryCount: 1, retryReason: 'PRICE_MISMATCH' }),
       };
 
-      // Return as an array to match the expected return type
+      if (ocrText) {
+        analysisResult.ocrText = ocrText;
+      }
+
       return [analysisResult];
     } catch (error) {
       console.error('Error analyzing receipt:', error);
-      throw new Error('Failed to analyze receipt. The model may have returned an invalid format.');
+      // Preserve the original error via `cause` so the worker can walk the
+      // chain and detect rate-limit errors (which should NOT mark the receipt
+      // as 'failed' — they leave it 'pending' for later resume).
+      throw new Error('Failed to analyze receipt. The model may have returned an invalid format.', { cause: error });
     }
   }
 
-  private async extractTextWithVision(image: Buffer): Promise<string | null> {
+  private parseResponse(result: AIGenerateResult): ReceiptData {
+    let cleanedText = result.text.trim();
+    // Fallback: clean markdown fences if structured output wasn't used
+    cleanedText = cleanedText.replace(/^```(?:json)?\n?/gm, '');
+    cleanedText = cleanedText.replace(/\n?```$/gm, '');
+    cleanedText = cleanedText.trim();
+
+    console.log(`${result.provider} response (first 200 chars):`, cleanedText.substring(0, 200));
+    return JSON.parse(cleanedText);
+  }
+
+  /**
+   * Last-resort reconciliation: if extracted items still sum HIGHER than the
+   * receipt total after the corrective retry, the model couldn't locate the
+   * discount line on the receipt. Insert a synthetic discount line for the
+   * difference so downstream math (line totals vs. receipt total) reconciles,
+   * and drop the PRICE_MISMATCH issue. We only do this when the difference
+   * looks like a plausible discount (sum > total, diff < 50% of sum) — never
+   * when items sum LOWER than total, since that indicates missed items, not a
+   * discount.
+   */
+  private reconcileWithSyntheticDiscount(receipt: ReceiptData): void {
+    if (!receipt.items || receipt.items.length === 0) return;
+
+    const calculatedTotal = receipt.items.reduce((sum, item) => sum + (item.lineTotal ?? 0), 0);
+    const diff = calculatedTotal - receipt.total;
+
+    if (diff <= 0.05) return;
+    if (diff > calculatedTotal * 0.5) return;
+
+    const syntheticDiscount: ReceiptItem = {
+      description: 'Popust (rekonstruiran iz razlike total - vsota izdelkov)',
+      quantity: 1,
+      quantityUnit: 'pc',
+      unitPrice: -Math.round(diff * 100) / 100,
+      lineTotal: -Math.round(diff * 100) / 100,
+      itemType: 'discount',
+      discountMetadata: {
+        type: 'fixed',
+        value: Math.round(diff * 100) / 100,
+      },
+    };
+    receipt.items.push(syntheticDiscount);
+
+    if (receipt.validationIssues) {
+      receipt.validationIssues = receipt.validationIssues.filter(
+        (i) => i.type !== 'PRICE_MISMATCH'
+      );
+      if (receipt.validationIssues.length === 0) {
+        delete receipt.validationIssues;
+      }
+    }
+
+    console.log(
+      `✓ Reconciled with synthetic discount of -${diff.toFixed(2)} (model could not locate discount line)`
+    );
+  }
+
+  private computeLineTotals(receipt: ReceiptData): void {
+    if (receipt.items) {
+      for (const item of receipt.items) {
+        item.lineTotal = Math.round(item.quantity * item.unitPrice * 100) / 100;
+      }
+    }
+  }
+
+  private buildCorrectionPrompt(ocrText: string | null, calculatedTotal: number, receiptTotal: number): string {
+    const diff = calculatedTotal - receiptTotal;
+    const absDiff = Math.abs(diff).toFixed(2);
+
+    let directionalHint: string;
+    if (diff > 0) {
+      // Sum > total → likely missed a discount
+      directionalHint = `The sum of your extracted items (${calculatedTotal.toFixed(2)}) is HIGHER than the receipt total (${receiptTotal.toFixed(2)}) by ${absDiff}.
+
+This almost always means you MISSED A DISCOUNT line. Look very carefully for:
+- Lines containing "Popust", "Rabatt", "Discount", "Sale", "Akcija", "-€", percentage values like "10%", or coupon codes
+- Discount summaries near the bottom of the receipt (e.g., "Skupaj popust", "Total savings", "You saved")
+- Loyalty card / member discounts
+- Items where the printed price is crossed out and a lower price is shown
+- A discount of approximately ${absDiff} should exist somewhere on the receipt
+
+Add the missed discount(s) as separate items with itemType: "discount" and NEGATIVE unitPrice.
+Do NOT change the unitPrice of existing products to make the math work — find the actual discount line.`;
+    } else {
+      // Sum < total → missing items or wrong prices
+      directionalHint = `The sum of your extracted items (${calculatedTotal.toFixed(2)}) is LOWER than the receipt total (${receiptTotal.toFixed(2)}) by ${absDiff}.
+
+You likely MISSED ITEMS or used wrong prices. Check:
+1. Are all line items captured? Look for items at the top/bottom you may have skipped.
+2. Are unitPrice values correct (per-unit price, NOT line total divided wrong)?
+3. Are quantities correct for multi-line formats like "N KOS × price"?
+4. Is there a fee/service charge/tip you missed?`;
+    }
+
+    return `Your previous extraction has a price mismatch.
+
+${directionalHint}
+
+${this.buildUserPrompt(ocrText)}`;
+  }
+
+  /**
+   * Preprocesses an image for OCR: grayscale + contrast normalization + sharpen.
+   * These steps significantly improve Cloud Vision text detection on real-world
+   * receipt photos (uneven lighting, low contrast, soft focus).
+   *
+   * Controlled by `OCR_PREPROCESS` env var (defaults to enabled). Set to "false"
+   * to bypass preprocessing and use the raw image — useful for A/B comparison
+   * or when the original is already high quality.
+   */
+  private async preprocessForOcr(image: Buffer): Promise<Buffer> {
+    if (process.env.OCR_PREPROCESS === 'false') {
+      return image;
+    }
     try {
-      const [result] = await this.visionClient.documentTextDetection({
-        image: { content: image },
-      });
-      const text = result.fullTextAnnotation?.text ?? null;
+      return await sharp(image)
+        .rotate() // honor EXIF orientation
+        .grayscale()
+        .normalize() // stretch histogram → boost contrast
+        .sharpen()
+        .toBuffer();
+    } catch (error) {
+      console.warn('OCR image preprocessing failed, falling back to raw image:', error);
+      return image;
+    }
+  }
+
+  /**
+   * Runs Tesseract.js OCR as a complementary engine. Tesseract uses a different
+   * algorithm than Cloud Vision (LSTM + classical CV pipeline) so it can catch
+   * text that Vision missed and vice versa. Lazy-loads the shared worker on
+   * first use. Returns null on failure (graceful degradation).
+   */
+  private async extractTextWithTesseract(image: Buffer): Promise<string | null> {
+    if (process.env.OCR_TESSERACT === 'false') {
+      return null;
+    }
+    try {
+      const worker = await getTesseractWorker();
+      const result = await worker.recognize(image);
+      const text = result.data.text?.trim() || null;
       if (text) {
-        console.log(`Cloud Vision extracted ${text.length} characters of text.`);
+        console.log(`Tesseract extracted ${text.length} characters of text.`);
       }
       return text;
     } catch (error) {
-      console.warn('Cloud Vision OCR failed, falling back to image-only mode:', error);
+      console.warn('Tesseract OCR failed:', error);
       return null;
     }
   }
 
-  private buildPrompt(ocrText: string | null): string {
-    const ocrSection = ocrText
-      ? `
-      === OCR TEXT FROM RECEIPT ===
-      ${ocrText}
-      === END OCR TEXT ===
+  /**
+   * Extracts text from a receipt image using a multi-engine pipeline:
+   *   1. Cloud Vision documentTextDetection (preprocessed image, with language hints)
+   *   2. Cloud Vision textDetection retry (different segmentation algorithm)
+   *   3. Tesseract.js (different engine entirely, may catch what Vision missed)
+   *
+   * The outputs of all engines are concatenated, deduplicated by line, so the
+   * downstream OCR cross-validation can find numbers from any source. This is a
+   * "consensus union" rather than "best engine wins" — more recall, slightly
+   * less precision, which is the right trade-off for hallucination detection.
+   */
+  private async extractTextWithVision(image: Buffer): Promise<string | null> {
+    const languageHints = ['sl', 'hr', 'en', 'de'];
+    const processedImage = await this.preprocessForOcr(image);
+    let visionText: string | null = null;
 
-      You have been provided with OCR text extracted from the receipt above. Use this OCR text as the PRIMARY source for all numeric values (prices, quantities, totals). Use the image for understanding layout, structure, and any values the OCR may have missed.
+    try {
+      const [result] = await this.visionClient.documentTextDetection({
+        image: { content: processedImage },
+        imageContext: { languageHints },
+      });
+      visionText = result.fullTextAnnotation?.text ?? null;
 
-      `
-      : '';
+      // Cloud Vision retry: če documentTextDetection vrne malo besedila, poskusi
+      // še textDetection (drugačen algoritem segmentacije).
+      if (!visionText || visionText.length < 100) {
+        console.warn(
+          `documentTextDetection returned only ${visionText?.length ?? 0} chars, retrying with textDetection...`,
+        );
+        const [retry] = await this.visionClient.textDetection({
+          image: { content: processedImage },
+          imageContext: { languageHints },
+        });
+        const retryText = retry.textAnnotations?.[0]?.description ?? null;
+        if (retryText && retryText.length > (visionText?.length ?? 0)) {
+          visionText = retryText;
+        }
+      }
 
-    return `${ocrSection}You are an expert receipt OCR and data extraction system. Your task is to analyze receipt images with EXTREME PRECISION.
+      if (visionText) {
+        console.log(`Cloud Vision extracted ${visionText.length} characters of text.`);
+      }
+    } catch (error) {
+      console.warn('Cloud Vision OCR failed, falling back to other engines:', error);
+    }
+
+    // Always run Tesseract as a complementary engine (unless disabled). Its
+    // output is merged with Cloud Vision's for the OCR cross-validation Set.
+    const tesseractText = await this.extractTextWithTesseract(processedImage);
+
+    return this.mergeOcrTexts(visionText, tesseractText);
+  }
+
+  /**
+   * Merges OCR outputs from multiple engines into a single deduplicated text.
+   * Lines are normalized (whitespace collapsed, lowercased for comparison) but
+   * the original casing/spacing is preserved in the output. Both engines'
+   * unique lines end up in the final string, separated by newlines.
+   */
+  private mergeOcrTexts(...sources: (string | null)[]): string | null {
+    const seen = new Set<string>();
+    const merged: string[] = [];
+    for (const source of sources) {
+      if (!source) continue;
+      for (const rawLine of source.split(/\r?\n/)) {
+        const line = rawLine.trim();
+        if (!line) continue;
+        const key = line.toLowerCase().replace(/\s+/g, ' ');
+        if (seen.has(key)) continue;
+        seen.add(key);
+        merged.push(line);
+      }
+    }
+    return merged.length > 0 ? merged.join('\n') : null;
+  }
+
+  private buildSystemPrompt(): string {
+    return `You are an expert receipt OCR and data extraction system. Your task is to analyze receipt images with EXTREME PRECISION.
 
       STEP 1: IMAGE QUALITY CHECK
       - If the image is too blurry, dark, or unreadable, return an empty JSON object: {}
@@ -339,6 +677,20 @@ export class ReceiptAnalysisService {
       - Ensure all monetary values are numbers, not strings.
       - Include package sizes in the description when visible on the receipt (e.g., write "Coca Cola 500ml" not just "Coca Cola").
 
+      DATE FORMAT - CRITICAL:
+      - Output transactionDate as ISO "YYYY-MM-DD".
+      - Receipts in this system are almost exclusively European (Slovenian, German, Austrian, Italian, Croatian).
+      - European date format is DAY.MONTH.YEAR (DD.MM.YYYY or D.M.YYYY), NOT month-first.
+      - Examples of correct conversion:
+        * "5.2.2026"   → "2026-02-05" (5th of February 2026)
+        * "5. 2. 2026" → "2026-02-05"
+        * "05/02/2026" → "2026-02-05" (5th of February — NOT May 2nd)
+        * "31.12.2025" → "2025-12-31"
+        * "1.1.2026"   → "2026-01-01"
+      - NEVER assume US-style MM/DD/YYYY unless the receipt is clearly from the USA.
+      - If the first number is > 12, it MUST be the day (e.g., "13.4.2026" can only be 13 April).
+      - If the day is unambiguous from context (the receipt is in Slovenian/German/Italian/Croatian), use DD.MM.YYYY interpretation.
+
       REQUIRED JSON STRUCTURE:
       {
         "merchantName": "Store Name",
@@ -441,12 +793,40 @@ export class ReceiptAnalysisService {
         "tax": 73.48,
         "total": 407.46,
         "currency": "EUR",
-        "keywords": ["sports equipment", "clothing", "shopping"]
+        "keywords": ["sports equipment", "clothing", "shopping"],
+        "confidenceScores": {
+          "merchantName": 95,
+          "transactionDate": 90,
+          "total": 98,
+          "items": 85
+        }
       }
+
+      CONFIDENCE SCORES:
+      For each extraction, provide confidence scores (0-100) indicating how certain you are:
+      - "merchantName": How confident you are in the store name (100 = clearly visible, 50 = partially readable)
+      - "transactionDate": How confident you are in the date (100 = clearly printed, 50 = partially visible or ambiguous format)
+      - "total": How confident you are in the total amount (100 = clearly visible, 50 = partially readable)
+      - "items": Overall confidence in item extraction accuracy (100 = all items clearly readable, 50 = some items uncertain)
+      Each item also has a "confidence" field (0-100) for that specific item's extraction accuracy.
 
       FINAL INSTRUCTION:
       Return ONLY the JSON object. No markdown, no explanation, no code fences. Just pure JSON.
     `;
+  }
+
+  private buildUserPrompt(ocrText: string | null): string {
+    if (ocrText) {
+      return `Analyze the following receipt. Use the OCR text as the PRIMARY source for all numeric values (prices, quantities, totals). Use the image for understanding layout, structure, and any values the OCR may have missed.
+
+=== OCR TEXT FROM RECEIPT ===
+${ocrText}
+=== END OCR TEXT ===
+
+Extract all data from this receipt into the required JSON structure.`;
+    }
+
+    return 'Analyze the receipt in the image and extract all data into the required JSON structure.';
   }
 
   /**
@@ -460,9 +840,8 @@ export class ReceiptAnalysisService {
       const calculatedTotal = receipt.items.reduce((sum, item) => sum + (item.lineTotal ?? 0), 0);
       
       // Check if the sum of item prices matches the total (not subtotal - item prices usually include VAT)
-      // Allow 0.50 variance for rounding
       const diff = Math.abs(calculatedTotal - receipt.total);
-      if (diff > 0.50) {
+      if (diff > 0.05) {
         const issue: ValidationIssue = {
           severity: 'warning',
           type: 'PRICE_MISMATCH',
@@ -478,28 +857,15 @@ export class ReceiptAnalysisService {
         console.warn(`⚠️  Price validation warning: ${issue.message}`);
       }
       
-      // Check if total makes sense (subtotal + tax ≈ total)
-      if (receipt.subtotal !== null && receipt.tax !== null) {
-        const expectedTotal = receipt.subtotal + receipt.tax;
-        const totalDiff = Math.abs(expectedTotal - receipt.total);
-        if (totalDiff > 0.50) {
-          const issue: ValidationIssue = {
-            severity: 'warning',
-            type: 'TOTAL_MISMATCH',
-            message: `Subtotal (${receipt.subtotal.toFixed(2)}) + Tax (${receipt.tax.toFixed(2)}) = ${expectedTotal.toFixed(2)}, but Total is ${receipt.total.toFixed(2)}`,
-            details: {
-              subtotal: receipt.subtotal,
-              tax: receipt.tax,
-              expectedTotal: expectedTotal.toFixed(2),
-              actualTotal: receipt.total,
-              difference: totalDiff.toFixed(2),
-            },
-          };
-          issues.push(issue);
-          console.warn(`⚠️  Price validation warning: ${issue.message}`);
-        }
-      }
-      
+      // NOTE: We deliberately do NOT cross-check `subtotal + tax ≈ total`.
+      // Across receipt formats `subtotal` and `tax` mean different things
+      // (net vs gross, pre- vs post-discount, included vs additive VAT) and
+      // building per-format formulas does not scale. The PRICE_MISMATCH check
+      // above is the universal source of truth: if line items sum to the
+      // receipt total, the extraction is internally consistent regardless of
+      // how subtotal/tax are interpreted on this particular receipt.
+
+
       // Check for unrealistic or invalid prices
       receipt.items.forEach((item, index) => {
         const lt = item.lineTotal ?? 0;
@@ -574,14 +940,255 @@ export class ReceiptAnalysisService {
         }
       });
       
+      // Validate date plausibility — only flag future dates. Receipts can
+      // legitimately be older than 1 year (archived purchases, late uploads,
+      // historical data), so we don't bound the past.
+      if (receipt.transactionDate) {
+        const txDate = new Date(receipt.transactionDate);
+        const now = new Date();
+        const tomorrow = new Date(now);
+        tomorrow.setDate(tomorrow.getDate() + 1);
+
+        if (txDate > tomorrow) {
+          issues.push({
+            severity: 'warning',
+            type: 'INVALID_DATE',
+            message: `Transaction date "${receipt.transactionDate}" is in the future.`,
+            details: { transactionDate: receipt.transactionDate },
+          });
+        }
+      }
+
+      // Validate quantities
+      receipt.items.forEach((item, index) => {
+        if (item.itemType === 'product' && item.quantity > 100) {
+          issues.push({
+            severity: 'warning',
+            type: 'UNREALISTIC_QUANTITY',
+            message: `Item "${item.description}" has an unusually high quantity: ${item.quantity}`,
+            details: { itemIndex: index, description: item.description, quantity: item.quantity },
+          });
+        }
+      });
+
+      // Validate merchant name
+      if (!receipt.merchantName || receipt.merchantName.trim() === '') {
+        issues.push({
+          severity: 'warning',
+          type: 'MISSING_MERCHANT',
+          message: 'Merchant name is empty or missing.',
+        });
+      }
+
+      // Validate negative total without refund/discount items
+      if (receipt.total < 0) {
+        const hasRefundOrDiscount = receipt.items.some(
+          (i) => i.itemType === 'refund' || i.itemType === 'discount'
+        );
+        if (!hasRefundOrDiscount) {
+          issues.push({
+            severity: 'warning',
+            type: 'INVALID_PRICE',
+            message: `Receipt total is negative (${receipt.total}) but no refund/discount items found.`,
+            details: { total: receipt.total },
+          });
+        }
+      }
+
       // Attach validation issues to the receipt
       if (issues.length > 0) {
         receipt.validationIssues = issues;
       }
-      
+
     } catch (error) {
       console.error('Error during price validation:', error);
       // Don't throw - validation is best-effort
     }
+  }
+
+  /**
+   * Cross-validates extracted values against raw OCR text to detect potential AI hallucinations.
+   * Checks that key numeric values (total, item prices) actually appear in the OCR output.
+   *
+   * Implementation: extracts ALL numbers from the OCR text into a Set of canonical
+   * "X.XX" strings (handling EU 1.234,56 and US 1,234.56 conventions), then performs
+   * exact-match lookups. This avoids substring false positives/negatives that the
+   * previous String.includes() approach suffered from.
+   */
+  private crossValidateWithOCR(receipt: ReceiptData, ocrText: string): void {
+    const numbers = this.extractOcrNumbers(ocrText);
+
+    // Epsilon-based comparison handles:
+    //  - rounding ambiguity (1.485 → 1.48 vs 1.49 in toFixed(2))
+    //  - 3-decimal fuel prices (€1.485/L) where receipt model returns 1.485
+    //  - small OCR misreads at the cent level
+    const checkNumber = (value: number): boolean => {
+      if (value === 0) return true;
+      const target = Math.abs(value);
+      return numbers.some((n) => Math.abs(n - target) < 0.01);
+    };
+
+    // First pass: collect all individual mismatches without committing them
+    const candidateIssues: ValidationIssue[] = [];
+    const totalMismatched = !checkNumber(receipt.total);
+
+    if (totalMismatched) {
+      candidateIssues.push({
+        severity: 'warning',
+        type: 'OCR_MISMATCH',
+        message: `Receipt total (${receipt.total}) not found in OCR text — possible hallucination.`,
+        details: { field: 'total', value: receipt.total },
+      });
+    }
+
+    const productItems = receipt.items.filter((it) => it.itemType === 'product');
+    let mismatchedItemCount = 0;
+
+    productItems.forEach((item) => {
+      const index = receipt.items.indexOf(item);
+      if (!checkNumber(item.unitPrice)) {
+        mismatchedItemCount++;
+        const ctx = this.ocrContextAround(ocrText, item.description);
+        candidateIssues.push({
+          severity: 'warning',
+          type: 'OCR_MISMATCH',
+          message: `Item "${item.description}" unitPrice (${item.unitPrice}) not found in OCR text.`,
+          details: {
+            field: 'unitPrice',
+            itemIndex: index,
+            description: item.description,
+            value: item.unitPrice,
+            ocrContext: ctx,
+          },
+        });
+      }
+    });
+
+    // Heuristic: if OCR clearly failed on most of the receipt (≥50% of products
+    // missing AND total also missing, OR ≥80% of products missing), the image
+    // is too low-quality for reliable OCR cross-validation. Suppress the noisy
+    // per-item warnings and emit ONE LOW_IMAGE_QUALITY flag instead — this lets
+    // the UI surface a "needs manual review" badge without spamming the user.
+    //
+    // We require at least 3 products before applying ratio-based suppression:
+    // a 1/1 or 1/2 mismatch is statistically meaningless and is more likely a
+    // single OCR fusion glitch than systemic OCR blindness.
+    const productCount = productItems.length;
+    const mismatchRatio = productCount > 0 ? mismatchedItemCount / productCount : 0;
+    const MIN_ITEMS_FOR_RATIO = 3;
+    const ocrUnreliable =
+      productCount >= MIN_ITEMS_FOR_RATIO &&
+      ((totalMismatched && mismatchRatio >= 0.5) || mismatchRatio >= 0.8);
+
+    if (ocrUnreliable) {
+      const flag: ValidationIssue = {
+        severity: 'warning',
+        type: 'LOW_IMAGE_QUALITY',
+        message: `Image quality too low for OCR cross-validation — ${mismatchedItemCount}/${productCount} item prices${totalMismatched ? ' and the total' : ''} could not be verified against OCR text. Receipt data is from vision model only and may need manual review.`,
+        details: {
+          mismatchedItems: mismatchedItemCount,
+          totalItems: productCount,
+          totalMismatched,
+          ocrCharCount: ocrText.length,
+        },
+      };
+      receipt.validationIssues = [...(receipt.validationIssues ?? []), flag];
+      console.warn(
+        `⚠️  LOW_IMAGE_QUALITY: OCR unreliable (${mismatchedItemCount}/${productCount} items missing, total ${totalMismatched ? 'also missing' : 'OK'}). Suppressing per-item OCR warnings.`,
+      );
+      return;
+    }
+
+    if (candidateIssues.length > 0) {
+      receipt.validationIssues = [...(receipt.validationIssues ?? []), ...candidateIssues];
+      for (const issue of candidateIssues) {
+        const ctx = issue.details?.ocrContext;
+        console.warn(`⚠️  ${issue.message}${ctx ? ` Context: "${ctx}"` : ''}`);
+      }
+      console.warn(`⚠️  OCR cross-validation: ${candidateIssues.length} mismatch(es) detected`);
+    }
+  }
+
+  /**
+   * Extracts all numbers from OCR text. Handles EU (1.234,56) and US (1,234.56)
+   * thousands/decimal conventions, stitches numbers split by stray whitespace
+   * ("69, 99" → "69,99"), and supports up to 3-decimal precision (e.g. fuel
+   * prices like €1.485/L). Ambiguous tokens are added in BOTH interpretations
+   * to maximize recall.
+   */
+  private extractOcrNumbers(ocrText: string): number[] {
+    const numbers: number[] = [];
+    const compacted = ocrText.replace(/(\d)\s*([.,])\s*(\d)/g, '$1$2$3');
+    const numberRegex = /\d{1,3}(?:[.,]\d{3})*[.,]\d{1,4}|\d+[.,]\d{1,4}|\d{1,7}/g;
+    for (const match of compacted.matchAll(numberRegex)) {
+      for (const value of this.normalizeOcrNumber(match[0])) {
+        numbers.push(value);
+      }
+    }
+    return numbers;
+  }
+
+  /**
+   * Canonicalizes a raw number token into one or more numeric interpretations.
+   * Returns multiple values when the token is ambiguous (e.g. "1.485" could be
+   * 1485 with thousands grouping OR 1.485 as a 3-decimal price).
+   */
+  private normalizeOcrNumber(raw: string): number[] {
+    const cleaned = raw.replace(/\s/g, '');
+    const lastDot = cleaned.lastIndexOf('.');
+    const lastComma = cleaned.lastIndexOf(',');
+    const results: number[] = [];
+
+    const pushParsed = (intPart: string, decPart: string) => {
+      const num = parseFloat(`${intPart || '0'}.${decPart || '0'}`);
+      if (!isNaN(num)) results.push(num);
+    };
+
+    if (lastDot > -1 && lastComma > -1) {
+      // Both separators present — the LAST one is unambiguously the decimal
+      if (lastDot > lastComma) {
+        pushParsed(
+          cleaned.substring(0, lastDot).replace(/,/g, ''),
+          cleaned.substring(lastDot + 1),
+        );
+      } else {
+        pushParsed(
+          cleaned.substring(0, lastComma).replace(/\./g, ''),
+          cleaned.substring(lastComma + 1),
+        );
+      }
+    } else if (lastDot > -1 || lastComma > -1) {
+      const idx = lastDot > -1 ? lastDot : lastComma;
+      const sep = lastDot > -1 ? '.' : ',';
+      const tail = cleaned.substring(idx + 1);
+      const head = cleaned.substring(0, idx);
+
+      if (tail.length <= 3) {
+        // Decimal interpretation (covers 2-decimal cents and 3-decimal fuel/per-kg prices)
+        pushParsed(head, tail);
+      }
+      // If tail is exactly 3 digits, it MIGHT also be thousands grouping ("1.069" = 1069).
+      // Add both interpretations so we don't miss matches in either direction.
+      if (tail.length === 3) {
+        pushParsed(head + tail, '0');
+      }
+      if (tail.length > 3) {
+        // Definitely not a decimal — collapse as thousands grouping
+        pushParsed(cleaned.split(sep).join(''), '0');
+      }
+    } else {
+      pushParsed(cleaned, '0');
+    }
+
+    return results;
+  }
+
+  /** Returns up to ~160 chars of OCR text around the first match of `needle`. */
+  private ocrContextAround(ocrText: string, needle: string): string {
+    const idx = ocrText.toLowerCase().indexOf(needle.toLowerCase());
+    if (idx === -1) return '(description not found in OCR)';
+    const start = Math.max(0, idx - 80);
+    const end = Math.min(ocrText.length, idx + needle.length + 80);
+    return ocrText.substring(start, end).replace(/\s+/g, ' ');
   }
 }

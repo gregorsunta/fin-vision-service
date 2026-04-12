@@ -1,4 +1,5 @@
-import { Worker } from 'bullmq';
+import { Worker, UnrecoverableError } from 'bullmq';
+import { AIRateLimitExceededError } from '../ai/errors.js';
 import { eq } from 'drizzle-orm';
 import fs from 'fs/promises';
 import sharp from 'sharp';
@@ -8,11 +9,24 @@ import { ReceiptJobData } from '../queue/index.js';
 import { checkForDuplicates, markReceiptAsDuplicate } from '../services/duplicate-detector.js';
 import { ImageSplitterService } from '../services/image-splitter.js';
 import { ReceiptAnalysisService } from '../services/receipt-analysis.js';
-import { saveFile, compressToWebP, correctOrientation } from '../utils/file-utils.js';
-import { ReceiptItem } from '../services/receipt-analysis.js';
+import { saveFile, compressToWebP } from '../utils/file-utils.js';
+import { ReceiptItem, ReceiptData } from '../services/receipt-analysis.js';
 import dotenv from 'dotenv';
 
 dotenv.config();
+
+function isRateLimitError(err: unknown): boolean {
+    return extractRateLimitError(err) !== null;
+}
+
+function extractRateLimitError(err: unknown): AIRateLimitExceededError | null {
+    let current: any = err;
+    for (let i = 0; i < 5 && current; i++) {
+        if (current instanceof AIRateLimitExceededError) return current;
+        current = current.cause;
+    }
+    return null;
+}
 
 function deriveReceiptCategory(items: ReceiptItem[]): string | null {
     const counts = new Map<string, number>();
@@ -31,6 +45,66 @@ function deriveReceiptCategory(items: ReceiptItem[]): string | null {
         }
     }
     return best;
+}
+
+async function saveExtractedData(
+    dbConn: typeof db,
+    extractedData: ReceiptData,
+    receiptId: number,
+    uploadId: number,
+    receiptCategory: string | null,
+) {
+    await dbConn.update(receipts)
+        .set({
+            status: 'processed',
+            storeName: extractedData.merchantName,
+            totalAmount: extractedData.total.toString(),
+            taxAmount: extractedData.tax?.toString(),
+            transactionDate: new Date(`${extractedData.transactionDate}T${extractedData.transactionTime || '00:00:00'}`),
+            currency: extractedData.currency || 'USD',
+            keywords: extractedData.keywords,
+            category: receiptCategory,
+            ocrText: extractedData.ocrText ?? null,
+            processingMetadata: extractedData.processingMetadata,
+            confidenceScores: extractedData.confidenceScores ?? null,
+        })
+        .where(eq(receipts.id, receiptId));
+
+    if (extractedData.items && extractedData.items.length > 0) {
+        await dbConn.insert(lineItems).values(
+            extractedData.items.map(item => ({
+                receiptId: receiptId,
+                description: item.description,
+                amount: item.quantity.toString(),
+                unit: item.quantityUnit || 'pc',
+                pricePerUnit: item.unitPrice.toString(),
+                totalPrice: (item.lineTotal ?? 0).toString(),
+                keywords: item.keywords,
+                category: item.category || null,
+                subcategory: item.subcategory || null,
+                itemType: item.itemType || ((item.lineTotal ?? 0) < 0 ? 'discount' : 'product'),
+                discountMetadata: item.discountMetadata || null,
+                parentLineItemId: null,
+                confidence: item.confidence?.toString() ?? null,
+            }))
+        );
+    }
+
+    if (extractedData.validationIssues && extractedData.validationIssues.length > 0) {
+        for (const issue of extractedData.validationIssues) {
+            await dbConn.insert(processingErrors).values({
+                uploadId: uploadId,
+                receiptId: receiptId,
+                category: 'VALIDATION_WARNING',
+                message: `${issue.type}: ${issue.message}`,
+                metadata: {
+                    severity: issue.severity,
+                    type: issue.type,
+                    details: issue.details,
+                },
+            });
+        }
+    }
 }
 
 async function processSingleReceipt(job: any, uploadId: number, receiptId: number, receiptImagePath: string) {
@@ -65,54 +139,7 @@ async function processSingleReceipt(job: any, uploadId: number, receiptId: numbe
 
             const receiptCategory = deriveReceiptCategory(extractedData.items);
 
-            await db.update(receipts)
-                .set({
-                    status: 'processed',
-                    storeName: extractedData.merchantName,
-                    totalAmount: extractedData.total.toString(),
-                    taxAmount: extractedData.tax?.toString(),
-                    transactionDate: new Date(`${extractedData.transactionDate}T${extractedData.transactionTime || '00:00:00'}`),
-                    currency: extractedData.currency || 'USD',
-                    keywords: extractedData.keywords,
-                    category: receiptCategory,
-                    processingMetadata: extractedData.processingMetadata,
-                })
-                .where(eq(receipts.id, receiptId));
-
-            if (extractedData.items && extractedData.items.length > 0) {
-                await db.insert(lineItems).values(
-                    extractedData.items.map(item => ({
-                        receiptId: receiptId,
-                        description: item.description,
-                        amount: item.quantity.toString(),
-                        unit: item.quantityUnit || 'pc',
-                        pricePerUnit: item.unitPrice.toString(),
-                        totalPrice: (item.lineTotal ?? 0).toString(),
-                        keywords: item.keywords,
-                        category: item.category || null,
-                        subcategory: item.subcategory || null,
-                        itemType: item.itemType || ((item.lineTotal ?? 0) < 0 ? 'discount' : 'product'),
-                        discountMetadata: item.discountMetadata || null,
-                        parentLineItemId: null,
-                    }))
-                );
-            }
-
-            if (extractedData.validationIssues && extractedData.validationIssues.length > 0) {
-                for (const issue of extractedData.validationIssues) {
-                    await db.insert(processingErrors).values({
-                        uploadId: uploadId,
-                        receiptId: receiptId,
-                        category: 'VALIDATION_WARNING',
-                        message: `${issue.type}: ${issue.message}`,
-                        metadata: {
-                            severity: issue.severity,
-                            type: issue.type,
-                            details: issue.details,
-                        },
-                    });
-                }
-            }
+            await saveExtractedData(db, extractedData, receiptId, uploadId, receiptCategory);
 
             console.log(`Job ${job.id}: Single receipt ${receiptId} processed successfully. Checking for duplicates...`);
             const duplicateCheck = await checkForDuplicates(receiptId, uploadJob.userId);
@@ -121,29 +148,55 @@ async function processSingleReceipt(job: any, uploadId: number, receiptId: numbe
             }
         } catch (err: any) {
             console.error(`Job ${job.id}: Error processing single receipt ${receiptId}:`, err);
-            await db.update(receipts).set({ status: 'failed' }).where(eq(receipts.id, receiptId));
-            await db.insert(processingErrors).values({
-                uploadId: uploadId,
-                receiptId: receiptId,
-                category: 'EXTRACTION_FAILURE',
-                message: err.message || 'An unknown error occurred during analysis.',
-                metadata: { stack: err.stack },
-            });
+            const rateLimitErr = extractRateLimitError(err);
+            if (rateLimitErr) {
+                // Mark as 'rate_limited' so it can be resumed once the limit
+                // resets. Record a fresh RATE_LIMITED error with the new
+                // reset time.
+                await db.update(receipts)
+                    .set({ status: 'rate_limited' })
+                    .where(eq(receipts.id, receiptId));
+                await db.insert(processingErrors).values({
+                    uploadId: uploadId,
+                    receiptId: receiptId,
+                    category: 'SYSTEM_ERROR',
+                    message: `AI rate limit hit on resume: ${err.message}`,
+                    metadata: {
+                        errorType: 'RATE_LIMITED',
+                        provider: rateLimitErr.provider,
+                        resetTime: rateLimitErr.resetTime.toISOString(),
+                    },
+                });
+            } else {
+                await db.update(receipts).set({ status: 'failed' }).where(eq(receipts.id, receiptId));
+                await db.insert(processingErrors).values({
+                    uploadId: uploadId,
+                    receiptId: receiptId,
+                    category: 'EXTRACTION_FAILURE',
+                    message: err.message || 'An unknown error occurred during analysis.',
+                    metadata: { stack: err.stack },
+                });
+            }
         }
 
-        // Recalculate upload status based on all receipts
+        // Recalculate upload status. 'rate_limited' receipts are NOT actively
+        // being processed — they wait for the user to click resume — so they
+        // count toward `partly_completed` rather than keeping the upload in
+        // 'processing' (which would show as "Analyzing" in the UI).
         const allReceipts = await db.select().from(receipts).where(eq(receipts.uploadId, uploadId));
         const allProcessed = allReceipts.every(r => r.status === 'processed');
+        const allFailedOrLimited = allReceipts.every(
+            r => r.status === 'failed' || r.status === 'unreadable' || r.status === 'rate_limited'
+        );
         const allFailed = allReceipts.every(r => r.status === 'failed' || r.status === 'unreadable');
-        const hasPending = allReceipts.some(r => r.status === 'pending');
 
-        let finalStatus: 'processing' | 'completed' | 'partly_completed' | 'failed';
-        if (hasPending) {
-            finalStatus = 'processing';
-        } else if (allProcessed) {
+        let finalStatus: 'completed' | 'partly_completed' | 'failed';
+        if (allProcessed) {
             finalStatus = 'completed';
         } else if (allFailed) {
             finalStatus = 'failed';
+        } else if (allFailedOrLimited) {
+            finalStatus = 'partly_completed';
         } else {
             finalStatus = 'partly_completed';
         }
@@ -213,11 +266,9 @@ const receiptProcessorWorker = new Worker<ReceiptJobData>('receipt-processing', 
         }
         
         console.log(`Job ${job.id}: Reading image from: ${fullImagePath}`);
-        const rawImageBuffer = await fs.readFile(fullImagePath);
-        // Normalize EXIF orientation, then correct content orientation for cases where
-        // EXIF is unreliable (e.g. phone held flat pointing downwards at receipts).
-        const exifNormalized = await sharp(rawImageBuffer).rotate().toBuffer();
-        const imageBuffer = await correctOrientation(exifNormalized);
+        // Image is already EXIF-normalized and metadata-stripped by compressToWebP() at upload time.
+        // No additional .rotate() or orientation correction needed.
+        const imageBuffer = await fs.readFile(fullImagePath);
 
         // 1. Split the image
         await job.updateProgress(5);
@@ -250,7 +301,7 @@ const receiptProcessorWorker = new Worker<ReceiptJobData>('receipt-processing', 
             const buffer = await sharp(imageBuffer).composite([{ input: Buffer.from(svgOverlay), blend: 'over' }]).toBuffer();
             markedImageBuffer = Buffer.from(buffer);
         }
-        const compressedMarked = await compressToWebP(markedImageBuffer, 75);
+        const compressedMarked = await compressToWebP(markedImageBuffer);
         const { publicUrl: markedImageUrl } = await saveFile(compressedMarked, `marked-${uploadId}.webp`);
         await db.update(receiptUploads).set({
             markedImageUrl,
@@ -261,13 +312,14 @@ const receiptProcessorWorker = new Worker<ReceiptJobData>('receipt-processing', 
         console.log(`Job ${job.id}: Found ${splitResult.images.length} receipts. Analyzing each...`);
         const receiptAnalyzer = new ReceiptAnalysisService();
         let allSucceeded = true;
+        let rateLimitedReached = false;
         const totalReceipts = splitResult.images.length;
 
         for (let i = 0; i < totalReceipts; i++) {
             const receiptImageBuffer = splitResult.images[i];
             const progress = 15 + Math.round((i / totalReceipts) * 80);
             await job.updateProgress(progress);
-            
+
             const compressedReceipt = await compressToWebP(receiptImageBuffer);
             const { publicUrl: receiptImageUrl } = await saveFile(compressedReceipt, `receipt-${uploadId}-${i}.webp`);
 
@@ -277,6 +329,24 @@ const receiptProcessorWorker = new Worker<ReceiptJobData>('receipt-processing', 
                 imageUrl: receiptImageUrl,
             });
             const receiptRecordId = receiptInsertResult[0].insertId;
+
+            // If we already hit a rate limit on a previous receipt in this batch,
+            // skip the AI call entirely — mark the receipt as 'rate_limited'
+            // and record a RATE_LIMITED error so the user can resume later.
+            if (rateLimitedReached) {
+                await db.update(receipts)
+                    .set({ status: 'rate_limited' })
+                    .where(eq(receipts.id, receiptRecordId));
+                await db.insert(processingErrors).values({
+                    uploadId: uploadId,
+                    receiptId: receiptRecordId,
+                    category: 'SYSTEM_ERROR',
+                    message: 'Skipped: previous receipt in this batch hit AI rate limit.',
+                    metadata: { errorType: 'RATE_LIMITED', skipped: true },
+                });
+                allSucceeded = false;
+                continue;
+            }
 
             try {
                 const analysisResult = await receiptAnalyzer.analyzeReceipts([receiptImageBuffer]);
@@ -288,61 +358,11 @@ const receiptProcessorWorker = new Worker<ReceiptJobData>('receipt-processing', 
 
                 const receiptCategory = deriveReceiptCategory(extractedData.items);
 
-                await db.update(receipts)
-                    .set({
-                        status: 'processed',
-                        storeName: extractedData.merchantName,
-                        totalAmount: extractedData.total.toString(),
-                        taxAmount: extractedData.tax?.toString(),
-                        transactionDate: new Date(`${extractedData.transactionDate}T${extractedData.transactionTime || '00:00:00'}`),
-                        currency: extractedData.currency || 'USD',
-                        keywords: extractedData.keywords,
-                        category: receiptCategory,
-                        processingMetadata: extractedData.processingMetadata,
-                    })
-                    .where(eq(receipts.id, receiptRecordId));
-
-                if (extractedData.items && extractedData.items.length > 0) {
-                    await db.insert(lineItems).values(
-                        extractedData.items.map(item => ({
-                            receiptId: receiptRecordId,
-                            description: item.description,
-                            amount: item.quantity.toString(),
-                            unit: item.quantityUnit || 'pc',
-                            pricePerUnit: item.unitPrice.toString(),
-                            totalPrice: (item.lineTotal ?? 0).toString(),
-                            keywords: item.keywords,
-                            category: item.category || null,
-                            subcategory: item.subcategory || null,
-                            itemType: item.itemType || ((item.lineTotal ?? 0) < 0 ? 'discount' : 'product'),
-                            discountMetadata: item.discountMetadata || null,
-                            parentLineItemId: null,
-                        }))
-                    );
-                }
-
-                // Store validation warnings in the database
-                if (extractedData.validationIssues && extractedData.validationIssues.length > 0) {
-                    console.warn(`Job ${job.id}: Receipt ${receiptRecordId} has ${extractedData.validationIssues.length} validation issue(s)`);
-                    
-                    for (const issue of extractedData.validationIssues) {
-                        await db.insert(processingErrors).values({
-                            uploadId: uploadId,
-                            receiptId: receiptRecordId,
-                            category: 'VALIDATION_WARNING',
-                            message: `${issue.type}: ${issue.message}`,
-                            metadata: {
-                                severity: issue.severity,
-                                type: issue.type,
-                                details: issue.details,
-                            },
-                        });
-                    }
-                }
+                await saveExtractedData(db, extractedData, receiptRecordId, uploadId, receiptCategory);
 
                 console.log(`Job ${job.id}: Receipt ${i+1}/${totalReceipts} processed successfully. Checking for duplicates...`);
                 const duplicateCheck = await checkForDuplicates(receiptRecordId, uploadJob.userId);
-                
+
                 if (duplicateCheck.isDuplicate && duplicateCheck.matchedReceipt) {
                     await markReceiptAsDuplicate(
                         receiptRecordId,
@@ -353,17 +373,41 @@ const receiptProcessorWorker = new Worker<ReceiptJobData>('receipt-processing', 
                 }
             } catch (err: any) {
                 allSucceeded = false;
+                const rateLimitErr = extractRateLimitError(err);
                 const errorMessage = err.message || 'An unknown error occurred during analysis.';
                 console.error(`Job ${job.id}: Error processing receipt ${receiptRecordId}:`, err);
 
-                await db.update(receipts).set({ status: 'failed' }).where(eq(receipts.id, receiptRecordId));
-                await db.insert(processingErrors).values({
-                    uploadId: uploadId,
-                    receiptId: receiptRecordId,
-                    category: 'EXTRACTION_FAILURE',
-                    message: errorMessage,
-                    metadata: { stack: err.stack },
-                });
+                if (rateLimitErr) {
+                    // Mark receipt as 'rate_limited' so the frontend can
+                    // distinguish it from receipts actively being processed
+                    // ('pending'). The resume endpoint filters on this status.
+                    // Stop processing remaining receipts in this batch — they
+                    // would all fail anyway.
+                    rateLimitedReached = true;
+                    await db.update(receipts)
+                        .set({ status: 'rate_limited' })
+                        .where(eq(receipts.id, receiptRecordId));
+                    await db.insert(processingErrors).values({
+                        uploadId: uploadId,
+                        receiptId: receiptRecordId,
+                        category: 'SYSTEM_ERROR',
+                        message: `AI rate limit hit: ${errorMessage}`,
+                        metadata: {
+                            errorType: 'RATE_LIMITED',
+                            provider: rateLimitErr.provider,
+                            resetTime: rateLimitErr.resetTime.toISOString(),
+                        },
+                    });
+                } else {
+                    await db.update(receipts).set({ status: 'failed' }).where(eq(receipts.id, receiptRecordId));
+                    await db.insert(processingErrors).values({
+                        uploadId: uploadId,
+                        receiptId: receiptRecordId,
+                        category: 'EXTRACTION_FAILURE',
+                        message: errorMessage,
+                        metadata: { stack: err.stack },
+                    });
+                }
             }
         }
 
@@ -382,7 +426,11 @@ const receiptProcessorWorker = new Worker<ReceiptJobData>('receipt-processing', 
             message: err.message,
             metadata: { stack: err.stack },
         });
-        // Re-throw the error to let BullMQ mark the job as failed
+        // Rate limit errors should NOT be retried — retries just waste more quota.
+        // Wrap as UnrecoverableError so BullMQ marks the job as permanently failed.
+        if (isRateLimitError(err)) {
+            throw new UnrecoverableError(`Rate limit hit: ${err.message}`);
+        }
         throw err;
     }
 }, { connection });

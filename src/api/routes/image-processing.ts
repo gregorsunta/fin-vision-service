@@ -45,6 +45,12 @@ export default async function imageProcessingRoutes(server: FastifyInstance) {
       .from(receipts)
       .where(eq(receipts.uploadId, uploadIdNum));
 
+    // Get any processing errors
+    const errors = await db
+      .select()
+      .from(processingErrors)
+      .where(eq(processingErrors.uploadId, uploadIdNum));
+
     // Get line items for all receipts
     const receiptsWithItems = await Promise.all(
       receiptsList.map(async (receipt) => {
@@ -52,7 +58,7 @@ export default async function imageProcessingRoutes(server: FastifyInstance) {
           .select()
           .from(lineItems)
           .where(eq(lineItems.receiptId, receipt.id));
-        
+
         return {
           id: receipt.id,
           uploadId: receipt.uploadId,
@@ -63,6 +69,7 @@ export default async function imageProcessingRoutes(server: FastifyInstance) {
           currency: receipt.currency,
           status: receipt.status,
           imageUrl: receipt.imageUrl,
+          ocrText: receipt.ocrText,
           keywords: receipt.keywords,
           isDuplicate: receipt.isDuplicate,
           duplicateOfReceiptId: receipt.duplicateOfReceiptId,
@@ -73,26 +80,50 @@ export default async function imageProcessingRoutes(server: FastifyInstance) {
       })
     );
 
-    // Get any processing errors
-    const errors = await db
-      .select()
-      .from(processingErrors)
-      .where(eq(processingErrors.uploadId, uploadIdNum));
+    // Rate-limited receipts have their own DB status now ('rate_limited').
+    // We still read processing_errors to surface reset times for the UI.
+    const rateLimitedErrors = errors.filter((e) => {
+      const meta = e.metadata as { errorType?: string } | null;
+      return meta?.errorType === 'RATE_LIMITED';
+    });
+    const rateLimitedReceiptIds = new Set(
+      receiptsList.filter(r => r.status === 'rate_limited').map(r => r.id)
+    );
 
     // Calculate statistics
     const totalDetected = receiptsList.length;
     const successfulCount = receiptsList.filter(r => r.status === 'processed').length;
     const failedCount = receiptsList.filter(r => r.status === 'failed' || r.status === 'unreadable').length;
     const processingCount = receiptsList.filter(r => r.status === 'pending').length;
+    const rateLimitedCount = rateLimitedReceiptIds.size;
     const receiptIdsWithWarnings = new Set(
       errors.filter(e => e.category === 'VALIDATION_WARNING' && e.receiptId).map(e => e.receiptId)
     );
     const needsReviewCount = receiptIdsWithWarnings.size;
+    // Pick the latest reset time across all rate-limited errors so the UI knows
+    // when the resume button can be enabled.
+    let resumableAt: string | null = null;
+    for (const e of rateLimitedErrors) {
+      const meta = e.metadata as { resetTime?: string } | null;
+      if (meta?.resetTime) {
+        if (!resumableAt || new Date(meta.resetTime) > new Date(resumableAt)) {
+          resumableAt = meta.resetTime;
+        }
+      }
+    }
+    const rateLimited = rateLimitedReceiptIds.size > 0
+      ? {
+          count: rateLimitedReceiptIds.size,
+          resumableAt,
+          message: 'Some receipts could not be processed because the AI rate limit was reached. You can resume processing once the limit resets.',
+        }
+      : null;
 
-    // Separate receipts into successful and failed
+    // Separate receipts by status
     const successfulReceipts = receiptsWithItems.filter(r => r.status === 'processed');
     const failedReceipts = receiptsWithItems.filter(r => r.status === 'failed' || r.status === 'unreadable');
     const processingReceipts = receiptsWithItems.filter(r => r.status === 'pending');
+    const rateLimitedReceipts = receiptsWithItems.filter(r => r.status === 'rate_limited');
 
     // Get all split receipt image URLs
     const splitReceiptImages = receiptsList.map(r => r.imageUrl).filter(url => url !== null);
@@ -120,6 +151,7 @@ export default async function imageProcessingRoutes(server: FastifyInstance) {
         successful: successfulCount,
         failed: failedCount,
         processing: processingCount,
+        rateLimited: rateLimitedCount,
         needsReview: needsReviewCount,
       },
 
@@ -145,11 +177,17 @@ export default async function imageProcessingRoutes(server: FastifyInstance) {
         successful: successfulReceipts,
         failed: failedReceipts,
         processing: processingReceipts,
+        rateLimited: rateLimitedReceipts,
         all: receiptsWithItems, // All receipts in one array for convenience
       },
 
       // Processing errors
       errors: errors,
+
+      // Rate limit info: present only when one or more receipts were skipped
+      // due to AI rate limits. Frontend should show a "Resume processing"
+      // button that becomes enabled at `resumableAt`.
+      rateLimited,
     });
   });
 
@@ -213,6 +251,7 @@ export default async function imageProcessingRoutes(server: FastifyInstance) {
       currency: receipt.currency,
       status: receipt.status,
       imageUrl: receipt.imageUrl,
+      ocrText: receipt.ocrText,
       keywords: receipt.keywords,
       isDuplicate: receipt.isDuplicate,
       duplicateOfReceiptId: receipt.duplicateOfReceiptId,
@@ -246,9 +285,6 @@ export default async function imageProcessingRoutes(server: FastifyInstance) {
         eq(receiptUploads.imageHash, imageHash)
       ));
 
-    const compressedBuffer = await compressToWebP(imageBuffer);
-    const { filePath, publicUrl: originalImageUrl } = await saveFile(compressedBuffer, 'upload.webp');
-
     // Get next upload number for this user
     const [{ maxNum }] = await db
       .select({ maxNum: sql<number>`COALESCE(MAX(${receiptUploads.uploadNumber}), 0)` })
@@ -256,8 +292,12 @@ export default async function imageProcessingRoutes(server: FastifyInstance) {
       .where(eq(receiptUploads.userId, request.user.id));
     const uploadNumber = maxNum + 1;
 
+    // Compress for storage and processing — this is what the worker always uses
+    const compressedBuffer = await compressToWebP(imageBuffer);
+    const { filePath, publicUrl: originalImageUrl } = await saveFile(compressedBuffer, 'upload.webp');
+
     if (existingUpload) {
-      // Duplicate upload detected — save record but skip processing
+      // Duplicate — save the compressed copy for display but no raw original (it won't be processed)
       const insertResult = await db.insert(receiptUploads).values({
         userId: request.user.id,
         uploadNumber,
@@ -277,11 +317,16 @@ export default async function imageProcessingRoutes(server: FastifyInstance) {
       });
     }
 
+    // Save the original file before compression for archival (can be cleaned up later via settings)
+    const originalExt = data.filename ? (path.extname(data.filename) || '.jpg') : '.jpg';
+    const { publicUrl: rawImageUrl } = await saveFile(imageBuffer, `raw${originalExt}`);
+
     // 1. Create the master upload job record
     const insertResult = await db.insert(receiptUploads).values({
         userId: request.user.id,
         uploadNumber,
         originalImageUrl,
+        rawImageUrl,
         imageHash,
         status: 'processing',
         updatedAt: new Date()
@@ -365,7 +410,7 @@ export default async function imageProcessingRoutes(server: FastifyInstance) {
       }
     }
 
-    // Reset receipt status to pending
+    // Reset receipt status to pending (also clears 'rate_limited')
     await db
       .update(receipts)
       .set({
@@ -401,7 +446,7 @@ export default async function imageProcessingRoutes(server: FastifyInstance) {
       receiptImagePath: receiptFilename ? path.join(UPLOADS_DIR, receiptFilename) : '',
     };
     await receiptProcessingQueue.add('process-single-receipt', jobData, {
-      jobId: `receipt-${receiptIdNum}`,
+      jobId: `receipt-${receiptIdNum}-reprocess-${Date.now()}`,
     });
 
     return reply.status(202).send({
@@ -409,6 +454,110 @@ export default async function imageProcessingRoutes(server: FastifyInstance) {
       receiptId: receiptIdNum,
       message: 'Single receipt reprocessing has been queued.',
       statusUrl: `/receipts/${uploadIdNum}/receipt/${receiptIdNum}`,
+    });
+  });
+
+  // POST endpoint to resume processing of receipts that were skipped due to
+  // AI rate limits. Re-queues each pending receipt with a RATE_LIMITED error
+  // as an individual single-receipt job. Safe to call repeatedly — if the
+  // rate limit window hasn't reset yet, the new jobs will simply hit the
+  // limit again and be re-queued.
+  server.post('/receipts/:uploadId/resume', { preHandler: [authenticate] }, async (request, reply) => {
+    if (!request.user) {
+      return reply.status(401).send({ error: 'User not authenticated.' });
+    }
+
+    const { uploadId } = request.params as { uploadId: string };
+    const uploadIdNum = parseInt(uploadId, 10);
+
+    if (isNaN(uploadIdNum)) {
+      return reply.status(400).send({ error: 'Invalid upload ID.' });
+    }
+
+    const [upload] = await db
+      .select()
+      .from(receiptUploads)
+      .where(eq(receiptUploads.id, uploadIdNum));
+
+    if (!upload) {
+      return reply.status(404).send({ error: 'Receipt upload not found.' });
+    }
+
+    if (upload.userId !== request.user.id) {
+      return reply.status(403).send({ error: 'Forbidden.' });
+    }
+
+    const errorsForUpload = await db
+      .select()
+      .from(processingErrors)
+      .where(eq(processingErrors.uploadId, uploadIdNum));
+
+    const rateLimitedReceiptIds = new Set(
+      errorsForUpload
+        .filter((e) => {
+          const meta = e.metadata as { errorType?: string } | null;
+          return meta?.errorType === 'RATE_LIMITED' && e.receiptId !== null;
+        })
+        .map((e) => e.receiptId as number)
+    );
+
+    if (rateLimitedReceiptIds.size === 0) {
+      return reply.status(400).send({ error: 'No rate-limited receipts to resume on this upload.' });
+    }
+
+    const allReceiptsForUpload = await db
+      .select()
+      .from(receipts)
+      .where(eq(receipts.uploadId, uploadIdNum));
+
+    const toResume = allReceiptsForUpload.filter(
+      (r) => rateLimitedReceiptIds.has(r.id) && r.status === 'rate_limited'
+    );
+
+    if (toResume.length === 0) {
+      return reply.status(400).send({ error: 'No rate-limited receipts found to resume.' });
+    }
+
+    // Reset their status back to 'pending' so the worker picks them up
+    for (const receipt of toResume) {
+      await db.update(receipts)
+        .set({ status: 'pending' })
+        .where(eq(receipts.id, receipt.id));
+    }
+
+    // Clear stale RATE_LIMITED errors before re-queueing so they don't pile up
+    for (const error of errorsForUpload) {
+      const meta = error.metadata as { errorType?: string } | null;
+      if (meta?.errorType === 'RATE_LIMITED' && error.receiptId && rateLimitedReceiptIds.has(error.receiptId)) {
+        await db.delete(processingErrors).where(eq(processingErrors.id, error.id));
+      }
+    }
+
+    // Re-queue each as a single-receipt job
+    const uploadFilename = path.basename(upload.originalImageUrl);
+    for (const receipt of toResume) {
+      const receiptFilename = receipt.imageUrl ? path.basename(receipt.imageUrl) : '';
+      const jobData: ReceiptJobData = {
+        uploadId: uploadIdNum,
+        imagePath: path.join(UPLOADS_DIR, uploadFilename),
+        receiptId: receipt.id,
+        receiptImagePath: receiptFilename ? path.join(UPLOADS_DIR, receiptFilename) : '',
+      };
+      await receiptProcessingQueue.add('process-single-receipt', jobData, {
+        jobId: `receipt-${receipt.id}-resume-${Date.now()}`,
+      });
+    }
+
+    await db
+      .update(receiptUploads)
+      .set({ status: 'processing', updatedAt: new Date() })
+      .where(eq(receiptUploads.id, uploadIdNum));
+
+    return reply.status(202).send({
+      uploadId: uploadIdNum,
+      resumedReceiptCount: toResume.length,
+      message: `Queued ${toResume.length} rate-limited receipt(s) for reprocessing.`,
+      statusUrl: `/receipts/${uploadIdNum}`,
     });
   });
 
@@ -523,13 +672,15 @@ export default async function imageProcessingRoutes(server: FastifyInstance) {
       })
       .where(eq(receiptUploads.id, uploadIdNum));
 
-    // Add a new job to the queue for reprocessing
+    // Add a new job to the queue for reprocessing.
+    // Use a unique jobId per reprocess attempt — BullMQ silently rejects duplicates
+    // if a job with the same jobId already exists (e.g. from the original upload).
     const jobData: ReceiptJobData = {
       uploadId: uploadIdNum,
       imagePath: imagePath,
     };
     await receiptProcessingQueue.add('process-receipt', jobData, {
-      jobId: `upload-${uploadIdNum}`,
+      jobId: `upload-${uploadIdNum}-reprocess-${Date.now()}`,
     });
 
     // Respond to the user
@@ -589,6 +740,9 @@ export default async function imageProcessingRoutes(server: FastifyInstance) {
     await db.delete(processingErrors).where(eq(processingErrors.uploadId, uploadIdNum));
 
     // Delete image files from disk
+    if (upload.rawImageUrl) {
+      await deleteFile(upload.rawImageUrl);
+    }
     if (upload.originalImageUrl) {
       await deleteFile(upload.originalImageUrl);
     }

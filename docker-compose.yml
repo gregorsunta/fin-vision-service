@@ -38,6 +38,25 @@ services:
       timeout: 3s
       retries: 5
 
+  cv-detector:
+    build: ./cv-detector-service
+    restart: unless-stopped
+    environment:
+      TORCH_NUM_THREADS: "${TORCH_NUM_THREADS:-2}"
+      GD_BOX_THRESHOLD: "${GD_BOX_THRESHOLD:-0.12}"
+      GD_TEXT_THRESHOLD: "${GD_TEXT_THRESHOLD:-0.12}"
+      GD_MAX_AREA_FRACTION: "${GD_MAX_AREA_FRACTION:-0.70}"
+      GD_NMS_IOU: "${GD_NMS_IOU:-0.30}"
+    ports:
+      - "${CV_DETECTOR_PORT:-8001}:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8000/health\")'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # Allow up to 60 s for the model to load on cold start.
+      start_period: 60s
+
 volumes:
   mysql-data:
   redis-data:

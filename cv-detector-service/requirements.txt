@@ -1,0 +1,11 @@
+# FastAPI server
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+python-multipart==0.0.12
+
+# ML inference: Grounding DINO Tiny via HuggingFace transformers
+# torch CPU build is installed separately in the Dockerfile from the PyTorch CPU wheel index
+# to avoid pulling in CUDA libraries (~2 GB savings).
+transformers==4.46.3
+Pillow==11.0.0
+numpy==2.1.2

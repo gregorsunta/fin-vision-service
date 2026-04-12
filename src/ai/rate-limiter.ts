@@ -58,6 +58,10 @@ export class RateLimiter {
   /**
    * Called when a provider returns a real 429. Sets the request count to max
    * so subsequent requests skip this provider until the window resets.
+   *
+   * If no retry-after hint is given, assume a short-term per-minute limit
+   * (60s) rather than a daily quota — this avoids locking the provider out
+   * for 24 hours when the actual issue is a transient per-minute throttle.
    */
   markExhausted(provider: AIProviderName, retryAfterMs?: number): void {
     const config = this.configs.get(provider);
@@ -68,14 +72,13 @@ export class RateLimiter {
     const entry = this.getOrCreateEntry(provider);
     entry.requests = config.maxRequests;
 
-    // If the provider told us when to retry, reset the window start so it
-    // expires at that time instead of the default 24h boundary.
-    if (retryAfterMs && retryAfterMs > 0) {
-      entry.windowStart = Date.now() - config.windowMs + retryAfterMs;
-    }
+    // Default to 60s back-off if the provider didn't tell us when to retry.
+    const backoffMs = retryAfterMs && retryAfterMs > 0 ? retryAfterMs : 60_000;
+    entry.windowStart = Date.now() - config.windowMs + backoffMs;
 
     console.log(
       `[RateLimiter] ${provider}: Marked as exhausted (real 429). ` +
+      `Backing off for ${Math.round(backoffMs / 1000)}s. ` +
       `Resets at ${this.getResetTime(provider).toISOString()}`
     );
   }

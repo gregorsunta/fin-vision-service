@@ -30,6 +30,7 @@ export const receiptUploads = mysqlTable('receipt_uploads', {
   userId: int('user_id').notNull(),
   uploadNumber: int('upload_number').notNull(),
   originalImageUrl: varchar('original_image_url', { length: 2048 }).notNull(),
+  rawImageUrl: varchar('raw_image_url', { length: 2048 }), // original uploaded file before compression; null = cleaned up or duplicate
   markedImageUrl: varchar('marked_image_url', { length: 2048 }),
   imageHash: varchar('image_hash', { length: 64 }),
   status: mysqlEnum('status', ['processing', 'completed', 'partly_completed', 'failed', 'duplicate'])
@@ -82,10 +83,11 @@ export const receipts = mysqlTable('receipts', {
   transactionDate: datetime('transaction_date'),
   // Enforcing ISO 4217 3-letter currency codes.
   currency: varchar('currency', { length: 3 }), // e.g., USD, EUR, GBP
-  status: mysqlEnum('status', ['pending', 'processed', 'failed', 'unreadable'])
+  status: mysqlEnum('status', ['pending', 'processed', 'failed', 'unreadable', 'rate_limited'])
     .default('pending')
     .notNull(),
   imageUrl: varchar('image_url', { length: 2048 }),
+  ocrText: text('ocr_text'),
   keywords: json('keywords'),
   category: varchar('category', { length: 50 }),
   
@@ -103,6 +105,14 @@ export const receipts = mysqlTable('receipts', {
     analysisModel: string;
     analysisProvider?: string;
     processedAt: string;
+    retryCount?: number;
+    retryReason?: string;
+  }>(),
+  confidenceScores: json('confidence_scores').$type<{
+    merchantName: number;
+    transactionDate: number;
+    total: number;
+    items: number;
   }>(),
 });
 
@@ -145,6 +155,7 @@ export const lineItems = mysqlTable('line_items', {
   keywords: json('keywords'),
   category: varchar('category', { length: 50 }),
   subcategory: varchar('subcategory', { length: 50 }),
+  confidence: decimal('confidence', { precision: 5, scale: 2 }),
 });
 
 

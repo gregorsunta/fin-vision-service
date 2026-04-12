@@ -4,6 +4,7 @@ import { db, users, receiptUploads, receipts, lineItems, processingErrors, dupli
 import { eq, inArray, desc, asc, sql, count, or } from 'drizzle-orm';
 import { authenticate } from '../auth.js';
 import fs from 'fs/promises';
+import { deleteFile } from '../../utils/file-utils.js';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { generateReceiptsCsv, generateItemsCsv, generateUploadsCsv } from '../../services/csvGenerator.js';
@@ -533,5 +534,51 @@ export default async function userRoutes(server: FastifyInstance) {
       request.log.error({ err: error as any }, 'Failed to export user uploads to CSV');
       reply.status(500).send({ error: 'Could not export uploads to CSV.', details: error });
     }
+  });
+
+  // GET storage stats — how many original files are stored and eligible for cleanup
+  server.get('/users/me/storage/stats', { preHandler: [authenticate] }, async (request, reply) => {
+    if (!request.user) return reply.status(401).send({ error: 'User not authenticated.' });
+
+    const uploads = await db
+      .select({ status: receiptUploads.status, rawImageUrl: receiptUploads.rawImageUrl })
+      .from(receiptUploads)
+      .where(eq(receiptUploads.userId, request.user.id));
+
+    const originalsStored = uploads.filter(u => u.rawImageUrl !== null).length;
+    const cleanupEligible = uploads.filter(
+      u => u.rawImageUrl !== null && (u.status === 'completed' || u.status === 'partly_completed')
+    ).length;
+
+    return reply.send({ originalsStored, cleanupEligible });
+  });
+
+  // POST cleanup — delete raw original files for successfully processed uploads
+  server.post('/users/me/storage/cleanup-originals', { preHandler: [authenticate] }, async (request, reply) => {
+    if (!request.user) return reply.status(401).send({ error: 'User not authenticated.' });
+
+    const allUploads = await db
+      .select({ id: receiptUploads.id, rawImageUrl: receiptUploads.rawImageUrl, status: receiptUploads.status })
+      .from(receiptUploads)
+      .where(eq(receiptUploads.userId, request.user.id));
+
+    const toClean = allUploads.filter(
+      u => u.rawImageUrl && (u.status === 'completed' || u.status === 'partly_completed')
+    );
+
+    let deletedCount = 0;
+    for (const upload of toClean) {
+      try {
+        await deleteFile(upload.rawImageUrl!);
+        await db.update(receiptUploads)
+          .set({ rawImageUrl: null })
+          .where(eq(receiptUploads.id, upload.id));
+        deletedCount++;
+      } catch (err) {
+        request.log.warn({ err, uploadId: upload.id }, 'Failed to delete raw image during cleanup');
+      }
+    }
+
+    return reply.send({ deletedCount, message: `Cleaned up ${deletedCount} original file(s).` });
   });
 }

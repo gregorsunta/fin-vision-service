@@ -39,3 +39,9 @@ Thumbs.db
 
 # Other
 cookie-jar.txt
+
+# Tesseract language data (downloaded at runtime)
+*.traineddata
+
+# Test artifacts
+/scripts/output/
