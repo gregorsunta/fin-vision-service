@@ -7,6 +7,7 @@ import { receiptUploads, receipts, lineItems, processingErrors, duplicateMatches
 import { eq, and, or, sql } from 'drizzle-orm';
 import { saveFile, compressToWebP, deleteFile, UPLOADS_DIR } from '../../utils/file-utils.js';
 import { overrideDuplicateFlag } from '../../services/duplicate-detector.js';
+import { ReceiptAnalysisService } from '../../services/receipt-analysis.js';
 import path from 'path';
 
 export default async function imageProcessingRoutes(server: FastifyInstance) {
@@ -68,6 +69,7 @@ export default async function imageProcessingRoutes(server: FastifyInstance) {
           transactionDate: receipt.transactionDate,
           currency: receipt.currency,
           status: receipt.status,
+          reviewStatus: receipt.reviewStatus,
           imageUrl: receipt.imageUrl,
           ocrText: receipt.ocrText,
           keywords: receipt.keywords,
@@ -93,13 +95,10 @@ export default async function imageProcessingRoutes(server: FastifyInstance) {
     // Calculate statistics
     const totalDetected = receiptsList.length;
     const successfulCount = receiptsList.filter(r => r.status === 'processed').length;
+    const needsReviewCount = receiptsList.filter(r => r.reviewStatus === 'needs_review').length;
     const failedCount = receiptsList.filter(r => r.status === 'failed' || r.status === 'unreadable').length;
     const processingCount = receiptsList.filter(r => r.status === 'pending').length;
     const rateLimitedCount = rateLimitedReceiptIds.size;
-    const receiptIdsWithWarnings = new Set(
-      errors.filter(e => e.category === 'VALIDATION_WARNING' && e.receiptId).map(e => e.receiptId)
-    );
-    const needsReviewCount = receiptIdsWithWarnings.size;
     // Pick the latest reset time across all rate-limited errors so the UI knows
     // when the resume button can be enabled.
     let resumableAt: string | null = null;
@@ -120,7 +119,8 @@ export default async function imageProcessingRoutes(server: FastifyInstance) {
       : null;
 
     // Separate receipts by status
-    const successfulReceipts = receiptsWithItems.filter(r => r.status === 'processed');
+    const successfulReceipts = receiptsWithItems.filter(r => r.status === 'processed' && r.reviewStatus === 'not_required');
+    const needsReviewReceipts = receiptsWithItems.filter(r => r.reviewStatus === 'needs_review');
     const failedReceipts = receiptsWithItems.filter(r => r.status === 'failed' || r.status === 'unreadable');
     const processingReceipts = receiptsWithItems.filter(r => r.status === 'pending');
     const rateLimitedReceipts = receiptsWithItems.filter(r => r.status === 'rate_limited');
@@ -175,10 +175,11 @@ export default async function imageProcessingRoutes(server: FastifyInstance) {
       // Receipts grouped by status
       receipts: {
         successful: successfulReceipts,
+        needsReview: needsReviewReceipts,
         failed: failedReceipts,
         processing: processingReceipts,
         rateLimited: rateLimitedReceipts,
-        all: receiptsWithItems, // All receipts in one array for convenience
+        all: receiptsWithItems,
       },
 
       // Processing errors
@@ -250,6 +251,7 @@ export default async function imageProcessingRoutes(server: FastifyInstance) {
       transactionDate: receipt.transactionDate,
       currency: receipt.currency,
       status: receipt.status,
+      reviewStatus: receipt.reviewStatus,
       imageUrl: receipt.imageUrl,
       ocrText: receipt.ocrText,
       keywords: receipt.keywords,
@@ -415,6 +417,7 @@ export default async function imageProcessingRoutes(server: FastifyInstance) {
       .update(receipts)
       .set({
         status: 'pending',
+        reviewStatus: 'not_required',
         storeName: null,
         totalAmount: null,
         taxAmount: null,
@@ -639,7 +642,7 @@ export default async function imageProcessingRoutes(server: FastifyInstance) {
     const filename = path.basename(upload.originalImageUrl);
     const imagePath = path.join(UPLOADS_DIR, filename);
 
-    // Delete existing receipts and line items for this upload
+    // Delete existing receipts, line items, and their image files
     const existingReceipts = await db
       .select()
       .from(receipts)
@@ -653,6 +656,9 @@ export default async function imageProcessingRoutes(server: FastifyInstance) {
           eq(duplicateMatches.potentialDuplicateId, receipt.id)
         )
       );
+      if (receipt.imageUrl) {
+        await deleteFile(receipt.imageUrl);
+      }
     }
 
     // Delete all receipts for this upload
@@ -661,13 +667,18 @@ export default async function imageProcessingRoutes(server: FastifyInstance) {
     // Delete any processing errors for this upload
     await db.delete(processingErrors).where(eq(processingErrors.uploadId, uploadIdNum));
 
+    // Delete the old marked image file (will be regenerated)
+    if (upload.markedImageUrl) {
+      await deleteFile(upload.markedImageUrl);
+    }
+
     // Update the upload status to 'processing'
     await db
       .update(receiptUploads)
       .set({
         status: 'processing',
-        markedImageUrl: null, // Clear the marked image URL
-        hasReceipts: null, // Reset receipt detection flag
+        markedImageUrl: null,
+        hasReceipts: null,
         updatedAt: new Date(),
       })
       .where(eq(receiptUploads.id, uploadIdNum));
@@ -754,5 +765,21 @@ export default async function imageProcessingRoutes(server: FastifyInstance) {
     await db.delete(receiptUploads).where(eq(receiptUploads.id, uploadIdNum));
 
     return reply.send({ message: 'Upload and all related data deleted.' });
+  });
+
+  // Test endpoint — no auth, development only
+  server.post('/ocr/test', async (request, reply) => {
+    const { preprocess } = request.query as { preprocess?: string };
+    const data = await request.file();
+    if (!data) {
+      return reply.status(400).send({ error: 'File upload is required.' });
+    }
+    const imageBuffer = await data.toBuffer();
+    const analysisService = new ReceiptAnalysisService();
+    const result = await analysisService.extractTextDebug(imageBuffer, preprocess !== 'false');
+    if (result.merged === null) {
+      return reply.status(422).send({ error: 'OCR failed to extract text from the image.' });
+    }
+    return reply.send(result);
   });
 }

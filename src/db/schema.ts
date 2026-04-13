@@ -86,6 +86,9 @@ export const receipts = mysqlTable('receipts', {
   status: mysqlEnum('status', ['pending', 'processed', 'failed', 'unreadable', 'rate_limited'])
     .default('pending')
     .notNull(),
+  reviewStatus: mysqlEnum('review_status', ['not_required', 'needs_review', 'reviewed'])
+    .default('not_required')
+    .notNull(),
   imageUrl: varchar('image_url', { length: 2048 }),
   ocrText: text('ocr_text'),
   keywords: json('keywords'),

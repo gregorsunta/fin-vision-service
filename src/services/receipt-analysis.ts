@@ -1,7 +1,7 @@
 import { ImageAnnotatorClient } from '@google-cloud/vision';
 import { SchemaType } from '@google/generative-ai';
 import sharp from 'sharp';
-import { createWorker, type Worker as TesseractWorker } from 'tesseract.js';
+import { createWorker, OEM, type Worker as TesseractWorker } from 'tesseract.js';
 import { AIService, getAIService, AIGenerateResult } from '../ai/index.js';
 import { buildCategoryPromptList } from './categories.js';
 
@@ -17,6 +17,19 @@ async function getTesseractWorker(): Promise<TesseractWorker> {
     });
   }
   return tesseractWorkerPromise;
+}
+
+// Separate OSD worker — `osd` traineddata is required for orientation detection
+// and is incompatible with language traineddata in the same worker.
+let osdWorkerPromise: Promise<TesseractWorker> | null = null;
+async function getOsdWorker(): Promise<TesseractWorker> {
+  if (!osdWorkerPromise) {
+    osdWorkerPromise = createWorker('osd', OEM.TESSERACT_ONLY).catch((err) => {
+      osdWorkerPromise = null;
+      throw err;
+    });
+  }
+  return osdWorkerPromise;
 }
 
 const receiptExtractionSchema = {
@@ -382,9 +395,48 @@ ${this.buildUserPrompt(ocrText)}`;
   }
 
   /**
-   * Preprocesses an image for OCR: grayscale + contrast normalization + sharpen.
-   * These steps significantly improve Cloud Vision text detection on real-world
-   * receipt photos (uneven lighting, low contrast, soft focus).
+   * Detects and corrects 90°/180°/270° rotation using Tesseract OSD before OCR.
+   * Gracefully returns the original image if OSD fails or confidence is too low.
+   *
+   * OSD only recognises axis-aligned orientations (multiples of 90°). Fine-grained
+   * tilt correction (< 45°) is already handled in ImageSplitterService at crop time.
+   */
+  private async correctRotation(image: Buffer): Promise<Buffer> {
+    // Minimum OSD confidence to act on a detected rotation (empirically ~1-3 is
+    // reliable; below this the detection is too noisy to trust).
+    const MIN_CONFIDENCE = 0.3;
+
+    try {
+      const worker = await getOsdWorker();
+      // Grayscale + normalize improve OSD confidence and 180° detection.
+      // PNG conversion because Tesseract/Leptonica doesn't handle WebP reliably.
+      const pngBuffer = await sharp(image).grayscale().normalize().png().toBuffer();
+      const { data } = await worker.detect(pngBuffer);
+
+      const degrees = data.orientation_degrees;
+      const confidence = data.orientation_confidence ?? 0;
+
+      if (degrees === null || degrees === 0 || confidence < MIN_CONFIDENCE) {
+        return image;
+      }
+
+      // `orientation_degrees` is the clockwise rotation already applied to the
+      // image. Rotating by the negative value restores upright orientation.
+      const correction = (360 - degrees) % 360;
+      console.log(`OSD: rotating image by ${correction}° to correct ${degrees}° orientation (confidence: ${confidence.toFixed(2)})`);
+
+      return await sharp(image).rotate(correction).toBuffer();
+    } catch (error) {
+      console.warn('OSD rotation detection failed, continuing with original orientation:', error);
+      return image;
+    }
+  }
+
+  /**
+   * Preprocesses an image for OCR: rotation correction + grayscale + contrast
+   * normalization + sharpen. These steps significantly improve Cloud Vision text
+   * detection on real-world receipt photos (uneven lighting, low contrast,
+   * soft focus, sideways/upside-down captures).
    *
    * Controlled by `OCR_PREPROCESS` env var (defaults to enabled). Set to "false"
    * to bypass preprocessing and use the raw image — useful for A/B comparison
@@ -395,8 +447,9 @@ ${this.buildUserPrompt(ocrText)}`;
       return image;
     }
     try {
-      return await sharp(image)
-        .rotate() // honor EXIF orientation
+      const oriented = await this.correctRotation(image);
+      return await sharp(oriented)
+        .rotate() // honor any remaining EXIF orientation
         .grayscale()
         .normalize() // stretch histogram → boost contrast
         .sharpen()
@@ -442,6 +495,58 @@ ${this.buildUserPrompt(ocrText)}`;
    * "consensus union" rather than "best engine wins" — more recall, slightly
    * less precision, which is the right trade-off for hallucination detection.
    */
+  public async extractText(image: Buffer): Promise<string | null> {
+    return this.extractTextWithVision(image);
+  }
+
+  public async extractTextDebug(image: Buffer, preprocess = true): Promise<{
+    visionDocument: string | null;
+    visionText: string | null;
+    tesseract: string | null;
+    merged: string | null;
+    charCounts: { visionDocument: number; visionText: number; tesseract: number; merged: number };
+  }> {
+    const languageHints = ['sl', 'hr', 'en', 'de'];
+    const processedImage = preprocess ? await this.preprocessForOcr(image) : image;
+
+    const [documentResult, textResult, tesseractText] = await Promise.allSettled([
+      this.visionClient.documentTextDetection({
+        image: { content: processedImage },
+        imageContext: { languageHints },
+      }),
+      this.visionClient.textDetection({
+        image: { content: processedImage },
+        imageContext: { languageHints },
+      }),
+      this.extractTextWithTesseract(processedImage),
+    ]);
+
+    const visionDocument = documentResult.status === 'fulfilled'
+      ? (documentResult.value[0].fullTextAnnotation?.text ?? null)
+      : null;
+
+    const visionText = textResult.status === 'fulfilled'
+      ? (textResult.value[0].textAnnotations?.[0]?.description ?? null)
+      : null;
+
+    const tesseract = tesseractText.status === 'fulfilled' ? tesseractText.value : null;
+
+    const merged = this.mergeOcrTexts(visionDocument, visionText, tesseract);
+
+    return {
+      visionDocument,
+      visionText,
+      tesseract,
+      merged,
+      charCounts: {
+        visionDocument: visionDocument?.length ?? 0,
+        visionText: visionText?.length ?? 0,
+        tesseract: tesseract?.length ?? 0,
+        merged: merged?.length ?? 0,
+      },
+    };
+  }
+
   private async extractTextWithVision(image: Buffer): Promise<string | null> {
     const languageHints = ['sl', 'hr', 'en', 'de'];
     const processedImage = await this.preprocessForOcr(image);

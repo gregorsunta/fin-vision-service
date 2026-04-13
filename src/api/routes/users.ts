@@ -186,16 +186,10 @@ export default async function userRoutes(server: FastifyInstance) {
           createdAt: receiptUploads.createdAt,
           updatedAt: receiptUploads.updatedAt,
           totalReceipts: sql<number>`COALESCE(COUNT(${receipts.id}), 0)`,
-          successfulReceipts: sql<number>`COALESCE(SUM(CASE WHEN ${receipts.status} = 'processed' THEN 1 ELSE 0 END), 0)`,
+          successfulReceipts: sql<number>`COALESCE(SUM(CASE WHEN ${receipts.status} = 'processed' AND ${receipts.reviewStatus} = 'not_required' THEN 1 ELSE 0 END), 0)`,
           failedReceipts: sql<number>`COALESCE(SUM(CASE WHEN ${receipts.status} IN ('failed', 'unreadable') THEN 1 ELSE 0 END), 0)`,
           processingReceipts: sql<number>`COALESCE(SUM(CASE WHEN ${receipts.status} = 'pending' THEN 1 ELSE 0 END), 0)`,
-          needsReviewReceipts: sql<number>`COALESCE((
-            SELECT COUNT(DISTINCT pe.receipt_id)
-            FROM processing_errors pe
-            INNER JOIN receipts r2 ON r2.id = pe.receipt_id
-            WHERE r2.upload_id = ${receiptUploads.id}
-            AND pe.category = 'VALIDATION_WARNING'
-          ), 0)`,
+          needsReviewReceipts: sql<number>`COALESCE(SUM(CASE WHEN ${receipts.reviewStatus} = 'needs_review' THEN 1 ELSE 0 END), 0)`,
         })
         .from(receiptUploads)
         .leftJoin(receipts, eq(receipts.uploadId, receiptUploads.id))

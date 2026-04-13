@@ -21,6 +21,7 @@ interface Receipt {
   currency: string | null;
   transactionDate: Date | null;
   status: string;
+  reviewStatus: string | null;
   keywords: string[] | null;
   lineItems: LineItem[];
 }
@@ -99,7 +100,7 @@ export function generateReceiptsCsv(receipts: Receipt[]): string {
 
   const headers = [
     'Receipt ID', 'Upload ID', 'Store Name', 'Total Amount', 'Tax Amount',
-    'Currency', 'Transaction Date', 'Status', 'Keywords',
+    'Currency', 'Transaction Date', 'Status', 'Review Status', 'Keywords',
   ];
   let csv = headers.join(',') + '\n';
 
@@ -113,6 +114,7 @@ export function generateReceiptsCsv(receipts: Receipt[]): string {
       quote(receipt.currency),
       quote(formatDate(receipt.transactionDate)),
       quote(receipt.status),
+      quote(receipt.reviewStatus ?? 'not_required'),
       quote(formatKeywords(receipt.keywords)),
     ].join(',') + '\n';
   }

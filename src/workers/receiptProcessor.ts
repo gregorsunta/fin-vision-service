@@ -3,6 +3,7 @@ import { AIRateLimitExceededError } from '../ai/errors.js';
 import { eq } from 'drizzle-orm';
 import fs from 'fs/promises';
 import sharp from 'sharp';
+import { createWorker, OEM, type Worker as TesseractWorker } from 'tesseract.js';
 import { db } from '../db/index.js';
 import { lineItems, processingErrors, receipts, receiptUploads } from '../db/schema.js';
 import { ReceiptJobData } from '../queue/index.js';
@@ -14,6 +15,52 @@ import { ReceiptItem, ReceiptData } from '../services/receipt-analysis.js';
 import dotenv from 'dotenv';
 
 dotenv.config();
+
+// OSD worker for axis-aligned orientation correction (90°/180°/270°).
+// Separate from the OCR worker in receipt-analysis.ts because `osd` traineddata
+// is incompatible with language traineddata.
+let osdWorkerPromise: Promise<TesseractWorker> | null = null;
+async function getOsdWorker(): Promise<TesseractWorker> {
+    if (!osdWorkerPromise) {
+        osdWorkerPromise = createWorker('osd', OEM.TESSERACT_ONLY).catch((err) => {
+            osdWorkerPromise = null;
+            throw err;
+        });
+    }
+    return osdWorkerPromise;
+}
+
+/**
+ * Detects text orientation via Tesseract OSD and rotates the image to upright.
+ * Called in the worker BEFORE saving, so the saved file and the OCR input are
+ * both already correctly oriented.
+ */
+async function correctOrientationOSD(image: Buffer, boxIndex: number): Promise<Buffer> {
+    const MIN_CONFIDENCE = 0.3;
+    try {
+        const worker = await getOsdWorker();
+        // Grayscale + normalize improve OSD confidence and 180° detection.
+        // PNG conversion because Tesseract/Leptonica doesn't handle WebP reliably.
+        const pngBuffer = await sharp(image).grayscale().normalize().png().toBuffer();
+        const { data } = await worker.detect(pngBuffer);
+
+        const degrees = data.orientation_degrees;
+        const confidence = data.orientation_confidence ?? 0;
+
+        console.log(`Receipt ${boxIndex}: OSD detected ${degrees}° orientation, confidence=${confidence.toFixed(2)}`);
+
+        if (degrees === null || degrees === 0 || confidence < MIN_CONFIDENCE) {
+            return image;
+        }
+
+        const correction = (360 - degrees) % 360;
+        console.log(`Receipt ${boxIndex}: OSD rotating by ${correction}° to correct ${degrees}° orientation`);
+        return await sharp(image).rotate(correction).toBuffer();
+    } catch (error) {
+        console.warn(`Receipt ${boxIndex}: OSD orientation detection failed, keeping original:`, error);
+        return image;
+    }
+}
 
 function isRateLimitError(err: unknown): boolean {
     return extractRateLimitError(err) !== null;
@@ -54,9 +101,11 @@ async function saveExtractedData(
     uploadId: number,
     receiptCategory: string | null,
 ) {
+    const hasWarnings = !!(extractedData.validationIssues && extractedData.validationIssues.length > 0);
     await dbConn.update(receipts)
         .set({
             status: 'processed',
+            reviewStatus: hasWarnings ? 'needs_review' : 'not_required',
             storeName: extractedData.merchantName,
             totalAmount: extractedData.total.toString(),
             taxAmount: extractedData.tax?.toString(),
@@ -320,7 +369,11 @@ const receiptProcessorWorker = new Worker<ReceiptJobData>('receipt-processing', 
             const progress = 15 + Math.round((i / totalReceipts) * 80);
             await job.updateProgress(progress);
 
-            const compressedReceipt = await compressToWebP(receiptImageBuffer);
+            // Correct axis-aligned rotation before saving — the oriented buffer is used
+            // for both the saved file (displayed on frontend) and OCR input.
+            const orientedBuffer = await correctOrientationOSD(receiptImageBuffer, i + 1);
+
+            const compressedReceipt = await compressToWebP(orientedBuffer);
             const { publicUrl: receiptImageUrl } = await saveFile(compressedReceipt, `receipt-${uploadId}-${i}.webp`);
 
             const receiptInsertResult = await db.insert(receipts).values({
@@ -349,7 +402,7 @@ const receiptProcessorWorker = new Worker<ReceiptJobData>('receipt-processing', 
             }
 
             try {
-                const analysisResult = await receiptAnalyzer.analyzeReceipts([receiptImageBuffer]);
+                const analysisResult = await receiptAnalyzer.analyzeReceipts([orientedBuffer]);
                 const extractedData = analysisResult[0];
 
                 if (!extractedData || !extractedData.total) {
