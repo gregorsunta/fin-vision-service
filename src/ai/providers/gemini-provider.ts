@@ -6,9 +6,11 @@ export class GeminiProvider implements AIProvider {
    * Detects rate-limit errors thrown by the Google Generative AI SDK.
    * Used by the registry so AIService stays provider-agnostic.
    */
-  static detectRateLimit(error: unknown): { is429: boolean; retryAfterMs?: number } {
-    if (error instanceof GoogleGenerativeAIFetchError && error.status === 429) {
-      return { is429: true };
+  static detectRateLimit(error: unknown): { is429: boolean; isTransient?: boolean; retryAfterMs?: number } {
+    if (error instanceof GoogleGenerativeAIFetchError) {
+      if (error.status === 429) return { is429: true };
+      // 503 = model overloaded/high demand — transient, worth retrying same provider
+      if (error.status === 503) return { is429: false, isTransient: true };
     }
     return { is429: false };
   }

@@ -12,6 +12,8 @@ import {
   timestamp,
   tinyint,
   boolean,
+  index,
+  uniqueIndex,
 } from 'drizzle-orm/mysql-core';
 
 // --- Users Table (unchanged) ---
@@ -22,6 +24,14 @@ export const users = mysqlTable('users', {
   password: text('password').notNull(),
   apiKey: varchar('api_key', { length: 255 }).unique(),
   refreshToken: text('refresh_token'),
+  autoResumeRateLimited: boolean('auto_resume_rate_limited').default(false).notNull(),
+  exportSettings: json('export_settings').$type<{
+    decimalSeparator: '.' | ',';
+    amountFormat: 'decimal' | 'cents' | 'integer4dp';
+    dateFormat: 'YYYY-MM-DD' | 'DD.MM.YYYY' | 'MM/DD/YYYY';
+    includeCurrency: boolean;
+    includeHeader: boolean;
+  }>(),
 });
 
 // --- New Tables ---
@@ -29,10 +39,13 @@ export const receiptUploads = mysqlTable('receipt_uploads', {
   id: serial('id').primaryKey(),
   userId: int('user_id').notNull(),
   uploadNumber: int('upload_number').notNull(),
+  // uploadNumber is unique per user — enforced by uq_user_upload_number index
   originalImageUrl: varchar('original_image_url', { length: 2048 }).notNull(),
   rawImageUrl: varchar('raw_image_url', { length: 2048 }), // original uploaded file before compression; null = cleaned up or duplicate
   markedImageUrl: varchar('marked_image_url', { length: 2048 }),
   imageHash: varchar('image_hash', { length: 64 }),
+  perceptualHash: varchar('perceptual_hash', { length: 16 }),
+  originalFileName: varchar('original_file_name', { length: 255 }), // original filename as uploaded by the user
   status: mysqlEnum('status', ['processing', 'completed', 'partly_completed', 'failed', 'duplicate'])
     .default('processing')
     .notNull(),
@@ -48,7 +61,9 @@ export const receiptUploads = mysqlTable('receipt_uploads', {
   }>(),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().onUpdateNow().notNull(),
-});
+}, (table) => ({
+  uqUserUploadNumber: uniqueIndex('uq_user_upload_number').on(table.userId, table.uploadNumber),
+}));
 
 export const processingErrors = mysqlTable('processing_errors', {
   id: serial('id').primaryKey(),
@@ -58,7 +73,9 @@ export const processingErrors = mysqlTable('processing_errors', {
   message: text('message'),
   metadata: json('metadata'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
-});
+}, (table) => ({
+  uploadIdIdx: index('idx_processing_errors_upload_id').on(table.uploadId),
+}));
 
 // Duplicate detection matches table
 export const duplicateMatches = mysqlTable('duplicate_matches', {
@@ -70,7 +87,10 @@ export const duplicateMatches = mysqlTable('duplicate_matches', {
   userAction: mysqlEnum('user_action', ['confirmed_duplicate', 'override', 'pending'])
     .default('pending'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
-});
+}, (table) => ({
+  receiptIdIdx: index('idx_duplicate_matches_receipt_id').on(table.receiptId),
+  potentialIdIdx: index('idx_duplicate_matches_potential_id').on(table.potentialDuplicateId),
+}));
 
 // --- Modified and Existing Tables ---
 export const receipts = mysqlTable('receipts', {
@@ -110,6 +130,12 @@ export const receipts = mysqlTable('receipts', {
     processedAt: string;
     retryCount?: number;
     retryReason?: string;
+    fieldWarnings?: Array<{
+      field: string;
+      source: 'llm_uncertain' | 'ocr_mismatch' | 'low_confidence';
+      reason: string;
+      detail?: string;
+    }>;
   }>(),
   confidenceScores: json('confidence_scores').$type<{
     merchantName: number;
@@ -117,7 +143,16 @@ export const receipts = mysqlTable('receipts', {
     total: number;
     items: number;
   }>(),
-});
+  editedAt: timestamp('edited_at'),
+  itemsNonReadable: boolean('items_non_readable').default(false).notNull(),
+  imageRotation: int('image_rotation').notNull().default(0),
+  deletedAt: timestamp('deleted_at'),
+  userReceiptNumber: int('user_receipt_number').notNull(),
+}, (table) => ({
+  uploadIdIdx: index('idx_receipts_upload_id').on(table.uploadId),
+  statusIdx: index('idx_receipts_status').on(table.status),
+  reviewStatusIdx: index('idx_receipts_review_status').on(table.reviewStatus),
+}));
 
 export const lineItems = mysqlTable('line_items', {
   id: serial('id').primaryKey(),
@@ -152,6 +187,11 @@ export const lineItems = mysqlTable('line_items', {
   unit: varchar('unit', { length: 50 }), // e.g., "pcs", "kg", "lbs", "liters"
   // This new field stores the price for a single unit, which is often on receipts but sometimes needs calculation. Can be null.
   pricePerUnit: decimal('price_per_unit', { precision: 13, scale: 4 }),
+  // Discount applied per unit (absolute amount, e.g. 0.30 means €0.30 off each unit).
+  // Present only on receipts that have a per-row discount column.
+  discountPerUnit: decimal('discount_per_unit', { precision: 13, scale: 4 }),
+  // Unit price excluding VAT, captured when the receipt shows both ex-VAT and incl-VAT columns.
+  unitPriceExVat: decimal('unit_price_ex_vat', { precision: 13, scale: 4 }),
   // The original 'unitPrice' was likely intended to be the line item's total price.
   // Renaming to 'totalPrice' for clarity. A line item must have a total price.
   totalPrice: decimal('total_price', { precision: 13, scale: 4 }).notNull(),
@@ -159,8 +199,30 @@ export const lineItems = mysqlTable('line_items', {
   category: varchar('category', { length: 50 }),
   subcategory: varchar('subcategory', { length: 50 }),
   confidence: decimal('confidence', { precision: 5, scale: 2 }),
-});
+  extractionFlags: json('extraction_flags').$type<{
+    source: 'llm_uncertain' | 'ocr_mismatch' | 'low_confidence';
+    reason: string;
+    detail?: string;
+  }>(),
+  deletedAt: timestamp('deleted_at'),
+  isUserAdded: boolean('is_user_added').default(false).notNull(),
+}, (table) => ({
+  receiptIdIdx: index('idx_line_items_receipt_id').on(table.receiptId),
+}));
 
+
+export const receiptEditHistory = mysqlTable('receipt_edit_history', {
+  id: serial('id').primaryKey(),
+  entityType: mysqlEnum('entity_type', ['receipt', 'line_item']).notNull(),
+  entityId: int('entity_id').notNull(),
+  fieldName: varchar('field_name', { length: 100 }).notNull(),
+  oldValue: text('old_value'),
+  newValue: text('new_value'),
+  changedBy: int('changed_by').notNull(),
+  changedAt: timestamp('changed_at').defaultNow().notNull(),
+}, (table) => ({
+  entityIdx: index('idx_entity').on(table.entityType, table.entityId, table.fieldName, table.changedAt),
+}));
 
 // --- Relations ---
 export const usersRelations = relations(users, ({ many }) => ({

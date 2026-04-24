@@ -65,10 +65,9 @@ export class GroqProvider implements AIProvider {
     }
 
     if (options.images && options.images.length > 0) {
-      const userContent: Array<
-        | { type: 'text'; text: string }
-        | { type: 'image_url'; image_url: { url: string } }
-      > = [{ type: 'text', text: options.prompt }];
+      const userContent: Array<Groq.Chat.ChatCompletionContentPart> = [
+        { type: 'text', text: options.prompt },
+      ];
 
       for (const image of options.images) {
         const base64 = image.data.toString('base64');
@@ -77,7 +76,11 @@ export class GroqProvider implements AIProvider {
           image_url: { url: `data:${image.mimeType};base64,${base64}` },
         });
       }
-      messages.push({ role: 'user', content: userContent as any });
+      const userMessage: Groq.Chat.ChatCompletionUserMessageParam = {
+        role: 'user',
+        content: userContent,
+      };
+      messages.push(userMessage);
     } else {
       messages.push({ role: 'user', content: options.prompt });
     }

@@ -2,7 +2,10 @@ import type { AIProvider, AIProviderName, AIGenerateOptions, AIGenerateResult, A
 import { AIRateLimitExceededError, AIProviderUnavailableError, AIGenerationError } from './errors.js';
 import { getRateLimiter, RateLimiter } from './rate-limiter.js';
 import { getProviderFactory, type ProviderFactory } from './providers/index.js';
+import { getConfig } from '../config/index.js';
+import { createLogger } from '../utils/logger.js';
 
+const log = createLogger('ai.service');
 const RATE_LIMIT_WINDOW_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 interface RegisteredProvider {
@@ -23,7 +26,7 @@ export class AIService {
     for (const providerConfig of config.providers) {
       const factory = getProviderFactory(providerConfig.kind);
       if (!factory) {
-        console.warn(`[AIService] Unknown provider kind: ${(providerConfig as any).kind}`);
+        log.warn({ kind: providerConfig.kind }, 'unknown provider kind');
         continue;
       }
 
@@ -34,8 +37,9 @@ export class AIService {
         providerConfig.rateLimit || 1000,
         RATE_LIMIT_WINDOW_MS
       );
-      console.log(
-        `[AIService] Registered ${provider.name} (rate limit: ${providerConfig.rateLimit || 1000}/day, vision: ${provider.capabilities.vision})`
+      log.info(
+        { provider: provider.name, rateLimit: providerConfig.rateLimit || 1000, vision: provider.capabilities.vision },
+        'registered AI provider',
       );
     }
 
@@ -58,56 +62,77 @@ export class AIService {
     }
 
     const attemptedProviders: AIProviderName[] = [];
+    const MAX_TRANSIENT_RETRIES = getConfig().AI_MAX_TRANSIENT_RETRIES;
 
     for (let i = 0; i < eligibleProviders.length; i++) {
       const { provider, factory } = eligibleProviders[i];
       const isLastProvider = i === eligibleProviders.length - 1;
       attemptedProviders.push(provider.name);
+      let transientRetries = 0;
 
       if (!this.rateLimiter.canMakeRequest(provider.name)) {
         const remaining = this.rateLimiter.getRemainingRequests(provider.name);
         const resetTime = this.rateLimiter.getResetTime(provider.name);
-        console.log(`[AIService] ${provider.name} rate limited (${remaining} remaining, resets at ${resetTime.toISOString()})`);
+        log.info({ provider: provider.name, remaining, resetTime: resetTime.toISOString() }, 'provider internally rate limited');
 
+        // Skip to fallback only when a fallback is available.
+        // If this is the last provider, attempt the real API call — the internal
+        // limiter's backoff may have expired or been set by a different worker
+        // instance, so we let the API be the authoritative source.
         if (this.fallbackEnabled && !isLastProvider) {
           continue;
         }
 
-        throw new AIRateLimitExceededError(provider.name, remaining, resetTime);
+        log.info({ provider: provider.name }, 'no fallback available, attempting provider despite internal backoff');
       }
 
-      try {
-        console.log(`[AIService] Using ${provider.name}`);
-        const result = await provider.generate(options);
-        this.rateLimiter.recordRequest(provider.name);
-        return result;
-      } catch (error) {
-        const rateLimitCheck = factory.detectRateLimit(error);
+      // Inner retry loop for transient errors (503 overloaded, etc.)
+      while (true) {
+        try {
+          log.debug(
+            { provider: provider.name, retry: transientRetries, maxRetries: MAX_TRANSIENT_RETRIES },
+            'using provider',
+          );
+          const result = await provider.generate(options);
+          this.rateLimiter.recordRequest(provider.name);
+          return result;
+        } catch (error) {
+          const rateLimitCheck = factory.detectRateLimit(error);
 
-        if (rateLimitCheck.is429) {
-          this.rateLimiter.markExhausted(provider.name, rateLimitCheck.retryAfterMs);
-          console.warn(`[AIService] ${provider.name} returned 429 (rate limited)`);
+          if (rateLimitCheck.is429) {
+            this.rateLimiter.markExhausted(provider.name, rateLimitCheck.retryAfterMs);
+            log.warn({ provider: provider.name }, 'provider returned 429 (rate limited)');
 
-          if (this.fallbackEnabled && !isLastProvider) {
-            console.log(`[AIService] Falling back to next provider...`);
-            continue;
+            if (this.fallbackEnabled && !isLastProvider) {
+              log.info({ provider: provider.name }, 'falling back to next provider');
+              break; // break inner while → continue outer for
+            }
+
+            throw new AIRateLimitExceededError(
+              provider.name,
+              0,
+              this.rateLimiter.getResetTime(provider.name)
+            );
           }
 
-          throw new AIRateLimitExceededError(
-            provider.name,
-            0,
-            this.rateLimiter.getResetTime(provider.name)
-          );
+          if (rateLimitCheck.isTransient && transientRetries < MAX_TRANSIENT_RETRIES) {
+            transientRetries++;
+            const backoffMs = transientRetries * 5000;
+            log.warn({ provider: provider.name, backoffMs, retry: transientRetries }, 'provider returned transient error (503), retrying');
+            await new Promise(r => setTimeout(r, backoffMs));
+            continue; // retry same provider
+          }
+
+          log.error({ err: error, provider: provider.name }, 'provider generation failed');
+
+          if (this.fallbackEnabled && !isLastProvider) {
+            log.info({ provider: provider.name }, 'falling back to next provider');
+            break; // break inner while → continue outer for
+          }
+
+          throw new AIGenerationError(provider.name, error as Error);
         }
-
-        console.error(`[AIService] ${provider.name} generation failed:`, error);
-
-        if (this.fallbackEnabled && !isLastProvider) {
-          console.log(`[AIService] Falling back to next provider...`);
-          continue;
-        }
-
-        throw new AIGenerationError(provider.name, error as Error);
+        break; // successful result already returned; this line is unreachable but satisfies the loop
       }
     }
 

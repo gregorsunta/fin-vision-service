@@ -18,7 +18,7 @@ import { GroqProvider } from './groq-provider.js';
  */
 export interface ProviderFactory {
   create(config: AIProviderConfig): AIProvider;
-  detectRateLimit(error: unknown): { is429: boolean; retryAfterMs?: number };
+  detectRateLimit(error: unknown): { is429: boolean; isTransient?: boolean; retryAfterMs?: number };
 }
 
 export const providerRegistry: Record<AIProviderKind, ProviderFactory> = {

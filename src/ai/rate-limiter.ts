@@ -1,4 +1,7 @@
 import type { AIProviderName } from './types.js';
+import { createLogger } from '../utils/logger.js';
+
+const log = createLogger('ai.rate-limiter');
 
 interface RateLimitEntry {
   requests: number;
@@ -50,8 +53,9 @@ export class RateLimiter {
     this.resetWindowIfExpired(provider, entry, config);
 
     entry.requests++;
-    console.log(
-      `[RateLimiter] ${provider}: ${entry.requests}/${config.maxRequests} requests used in current window`
+    log.debug(
+      { provider, used: entry.requests, max: config.maxRequests },
+      'rate limiter recorded request',
     );
   }
 
@@ -76,10 +80,13 @@ export class RateLimiter {
     const backoffMs = retryAfterMs && retryAfterMs > 0 ? retryAfterMs : 60_000;
     entry.windowStart = Date.now() - config.windowMs + backoffMs;
 
-    console.log(
-      `[RateLimiter] ${provider}: Marked as exhausted (real 429). ` +
-      `Backing off for ${Math.round(backoffMs / 1000)}s. ` +
-      `Resets at ${this.getResetTime(provider).toISOString()}`
+    log.info(
+      {
+        provider,
+        backoffSeconds: Math.round(backoffMs / 1000),
+        resetTime: this.getResetTime(provider).toISOString(),
+      },
+      'rate limiter marked provider as exhausted (real 429)',
     );
   }
 
@@ -121,7 +128,7 @@ export class RateLimiter {
   ): void {
     const now = Date.now();
     if (now - entry.windowStart >= config.windowMs) {
-      console.log(`[RateLimiter] ${provider}: Rate limit window reset`);
+      log.info({ provider }, 'rate limit window reset');
       entry.requests = 0;
       entry.windowStart = now;
     }

@@ -1,18 +1,21 @@
 import '../db/index.js'; // Ensure DB connection is initialized
 import receiptProcessorWorker from './receiptProcessor.js';
+import { createLogger } from '../utils/logger.js';
 import dotenv from 'dotenv';
 
 dotenv.config();
 
-console.log('Worker process started. Listening for receipt processing jobs...');
+const log = createLogger('worker.bootstrap');
+
+log.info('worker process started, listening for receipt processing jobs');
 
 const gracefulShutdown = () => {
-    console.log('Shutting down worker gracefully...');
+    log.info('shutting down worker gracefully');
     receiptProcessorWorker.close().then(() => {
-        console.log('Worker has been closed.');
+        log.info('worker has been closed');
         process.exit(0);
     }).catch(err => {
-        console.error('Error during worker shutdown:', err);
+        log.error({ err }, 'error during worker shutdown');
         process.exit(1);
     });
 };

@@ -7,7 +7,7 @@ import fs from 'fs/promises';
 import { deleteFile } from '../../utils/file-utils.js';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { generateReceiptsCsv, generateItemsCsv, generateUploadsCsv } from '../../services/csvGenerator.js';
+import { generateReceiptsCsv, generateItemsCsv, generateUploadsCsv, DEFAULT_EXPORT_OPTIONS, type CsvReceipt, type ExportOptions } from '../../services/csvGenerator.js';
 import {
   hashPassword,
   comparePasswords,
@@ -19,9 +19,6 @@ import {
 
 import { z } from 'zod';
 import { registrationSchema, loginSchema } from '../../validation/authSchemas.js';
-
-// Define a placeholder type that matches what generateReceiptsCsv expects.
-type Receipt = any;
 
 export default async function userRoutes(server: FastifyInstance) {
 
@@ -150,11 +147,14 @@ export default async function userRoutes(server: FastifyInstance) {
 
     try {
       // Parse and validate query parameters
-      const queryParams = request.query as any;
-      const limit = Math.min(Math.max(parseInt(queryParams.limit) || 50, 1), 100);
-      const offset = Math.max(parseInt(queryParams.offset) || 0, 0);
-      const sortBy = ['createdAt', 'updatedAt', 'status'].includes(queryParams.sortBy) 
-        ? queryParams.sortBy 
+      const queryParams = request.query as Record<string, string | undefined>;
+      const limit = Math.min(Math.max(parseInt(queryParams.limit ?? '') || 50, 1), 100);
+      const offset = Math.max(parseInt(queryParams.offset ?? '') || 0, 0);
+      const sortableColumns = ['createdAt', 'updatedAt', 'status'] as const;
+      type SortableColumn = typeof sortableColumns[number];
+      const rawSortBy = queryParams.sortBy;
+      const sortBy: SortableColumn = (sortableColumns as readonly string[]).includes(rawSortBy ?? '')
+        ? (rawSortBy as SortableColumn)
         : 'createdAt';
       const sortOrder = queryParams.sortOrder === 'asc' ? 'asc' : 'desc';
       const statusFilter = queryParams.status && ['processing', 'completed', 'partly_completed', 'failed', 'duplicate'].includes(queryParams.status)
@@ -181,15 +181,21 @@ export default async function userRoutes(server: FastifyInstance) {
           uploadNumber: receiptUploads.uploadNumber,
           originalImageUrl: receiptUploads.originalImageUrl,
           markedImageUrl: receiptUploads.markedImageUrl,
+          originalFileName: receiptUploads.originalFileName,
           status: receiptUploads.status,
           hasReceipts: receiptUploads.hasReceipts,
           createdAt: receiptUploads.createdAt,
           updatedAt: receiptUploads.updatedAt,
-          totalReceipts: sql<number>`COALESCE(COUNT(${receipts.id}), 0)`,
-          successfulReceipts: sql<number>`COALESCE(SUM(CASE WHEN ${receipts.status} = 'processed' AND ${receipts.reviewStatus} = 'not_required' THEN 1 ELSE 0 END), 0)`,
-          failedReceipts: sql<number>`COALESCE(SUM(CASE WHEN ${receipts.status} IN ('failed', 'unreadable') THEN 1 ELSE 0 END), 0)`,
-          processingReceipts: sql<number>`COALESCE(SUM(CASE WHEN ${receipts.status} = 'pending' THEN 1 ELSE 0 END), 0)`,
-          needsReviewReceipts: sql<number>`COALESCE(SUM(CASE WHEN ${receipts.reviewStatus} = 'needs_review' THEN 1 ELSE 0 END), 0)`,
+          totalReceipts: sql<number>`COALESCE(SUM(CASE WHEN ${receipts.deletedAt} IS NULL THEN 1 ELSE 0 END), 0)`,
+          successfulReceipts: sql<number>`COALESCE(SUM(CASE WHEN ${receipts.status} = 'processed' AND ${receipts.deletedAt} IS NULL THEN 1 ELSE 0 END), 0)`,
+          failedReceipts: sql<number>`COALESCE(SUM(CASE WHEN ${receipts.status} IN ('failed', 'unreadable') AND ${receipts.deletedAt} IS NULL THEN 1 ELSE 0 END), 0)`,
+          processingReceipts: sql<number>`COALESCE(SUM(CASE WHEN ${receipts.status} = 'pending' AND ${receipts.deletedAt} IS NULL THEN 1 ELSE 0 END), 0)`,
+          needsReviewReceipts: sql<number>`COALESCE(SUM(CASE WHEN ${receipts.reviewStatus} = 'needs_review' AND ${receipts.deletedAt} IS NULL THEN 1 ELSE 0 END), 0)`,
+          editedReceipts: sql<number>`COALESCE(SUM(CASE WHEN ${receipts.editedAt} IS NOT NULL AND ${receipts.deletedAt} IS NULL THEN 1 ELSE 0 END), 0)`,
+          rateLimitedReceipts: sql<number>`COALESCE(SUM(CASE WHEN ${receipts.status} = 'rate_limited' AND ${receipts.deletedAt} IS NULL THEN 1 ELSE 0 END), 0)`,
+          totalValue: sql<string>`COALESCE(SUM(CASE WHEN ${receipts.deletedAt} IS NULL AND ${receipts.totalAmount} IS NOT NULL THEN ${receipts.totalAmount} ELSE 0 END), 0)`,
+          currencyCount: sql<number>`COUNT(DISTINCT CASE WHEN ${receipts.deletedAt} IS NULL AND ${receipts.currency} IS NOT NULL THEN ${receipts.currency} END)`,
+          primaryCurrency: sql<string>`MIN(CASE WHEN ${receipts.deletedAt} IS NULL AND ${receipts.currency} IS NOT NULL THEN ${receipts.currency} END)`,
         })
         .from(receiptUploads)
         .leftJoin(receipts, eq(receipts.uploadId, receiptUploads.id))
@@ -199,18 +205,19 @@ export default async function userRoutes(server: FastifyInstance) {
         )
         .groupBy(receiptUploads.id)
         .orderBy(
-          sortOrder === 'asc' 
-            ? asc(receiptUploads[sortBy as keyof typeof receiptUploads] as any)
-            : desc(receiptUploads[sortBy as keyof typeof receiptUploads] as any)
+          sortOrder === 'asc'
+            ? asc(receiptUploads[sortBy])
+            : desc(receiptUploads[sortBy])
         )
         .limit(limit)
         .offset(offset);
 
       // Format response
       const formattedUploads = uploadsWithStats.map(upload => {
-        // Extract filename from URL
+        // Prefer original filename saved at upload time; fall back to URL-derived name
         const urlParts = upload.originalImageUrl.split('/');
-        const fileName = urlParts[urlParts.length - 1] || 'unknown.jpg';
+        const urlFileName = urlParts[urlParts.length - 1] || 'unknown.jpg';
+        const fileName = upload.originalFileName || urlFileName;
 
         return {
           uploadId: upload.uploadId,
@@ -226,6 +233,11 @@ export default async function userRoutes(server: FastifyInstance) {
             failed: Number(upload.failedReceipts),
             processing: Number(upload.processingReceipts),
             needsReview: Number(upload.needsReviewReceipts),
+            edited: Number(upload.editedReceipts),
+            rateLimited: Number(upload.rateLimitedReceipts),
+            totalValue: Number(upload.totalValue).toFixed(2),
+            currency: Number(upload.currencyCount) === 1 ? (upload.primaryCurrency ?? null) : null,
+            mixedCurrencies: Number(upload.currencyCount) > 1,
           },
           images: {
             original: upload.originalImageUrl,
@@ -336,32 +348,27 @@ export default async function userRoutes(server: FastifyInstance) {
       };
 
       if (receiptIds.length > 0) {
-        // Delete line items
         const lineItemsResult = await db.delete(lineItems).where(inArray(lineItems.receiptId, receiptIds));
-        deletedCounts.lineItems = (lineItemsResult as any).affectedRows || 0;
+        deletedCounts.lineItems = lineItemsResult[0].affectedRows || 0;
 
-        // Delete duplicate matches (both where this receipt is the source or the target)
         const duplicateMatchesResult = await db.delete(duplicateMatches).where(
           or(
             inArray(duplicateMatches.receiptId, receiptIds),
             inArray(duplicateMatches.potentialDuplicateId, receiptIds)
           )
         );
-        deletedCounts.duplicateMatches = (duplicateMatchesResult as any).affectedRows || 0;
+        deletedCounts.duplicateMatches = duplicateMatchesResult[0].affectedRows || 0;
       }
 
       if (uploadIds.length > 0) {
-        // Delete processing errors
         const errorsResult = await db.delete(processingErrors).where(inArray(processingErrors.uploadId, uploadIds));
-        deletedCounts.errors = (errorsResult as any).affectedRows || 0;
+        deletedCounts.errors = errorsResult[0].affectedRows || 0;
 
-        // Delete receipts
         const receiptsResult = await db.delete(receipts).where(inArray(receipts.uploadId, uploadIds));
-        deletedCounts.receipts = (receiptsResult as any).affectedRows || 0;
+        deletedCounts.receipts = receiptsResult[0].affectedRows || 0;
 
-        // Delete uploads
         const uploadsResult = await db.delete(receiptUploads).where(eq(receiptUploads.userId, userId));
-        deletedCounts.uploads = (uploadsResult as any).affectedRows || 0;
+        deletedCounts.uploads = uploadsResult[0].affectedRows || 0;
       }
 
       // 5. Delete physical files from disk
@@ -394,79 +401,59 @@ export default async function userRoutes(server: FastifyInstance) {
     }
   });
 
+  async function getUserExportOptions(userId: number): Promise<ExportOptions> {
+    const [user] = await db.select({ exportSettings: users.exportSettings }).from(users).where(eq(users.id, userId));
+    return { ...DEFAULT_EXPORT_OPTIONS, ...(user?.exportSettings ?? {}) };
+  }
+
   // Route to export receipt summaries as CSV (no line items)
   server.get('/users/me/receipts/export-csv', { preHandler: [authenticate] }, async (request, reply) => {
-    if (!request.user) {
-      return reply.status(401).send({ error: 'Authentication required.' });
-    }
+    if (!request.user) return reply.status(401).send({ error: 'Authentication required.' });
 
     try {
+      const opts = await getUserExportOptions(request.user.id);
       const userUploads = await db.select({ id: receiptUploads.id }).from(receiptUploads).where(eq(receiptUploads.userId, request.user.id));
 
-      if (userUploads.length === 0) {
-        return reply.status(404).send({ message: 'No receipt uploads found for this user.' });
-      }
+      if (userUploads.length === 0) return reply.status(404).send({ message: 'No receipt uploads found for this user.' });
 
       const uploadIds = userUploads.map(u => u.id);
+      const userReceipts: CsvReceipt[] = await db.query.receipts.findMany({ where: inArray(receipts.uploadId, uploadIds) });
 
-      const userReceipts: Receipt[] = await db.query.receipts.findMany({
-        where: inArray(receipts.uploadId, uploadIds),
-      });
+      if (!userReceipts?.length) return reply.status(404).send({ message: 'No processed receipts found for this user.' });
 
-      if (!userReceipts || userReceipts.length === 0) {
-        return reply.status(404).send({ message: 'No processed receipts found for this user.' });
-      }
-
-      const csv = generateReceiptsCsv(userReceipts);
-
+      const csv = generateReceiptsCsv(userReceipts, opts);
       reply.header('Content-Type', 'text/csv');
       reply.header('Content-Disposition', `attachment; filename="receipts_export.csv"`);
       reply.send(csv);
-
     } catch (error) {
-      request.log.error({ err: error as any }, 'Failed to export user receipts to CSV');
+      request.log.error({ err: error }, 'Failed to export user receipts to CSV');
       reply.status(500).send({ error: 'Could not export receipts to CSV.', details: error });
     }
   });
 
   // Route to export all line items as CSV
   server.get('/users/me/items/export-csv', { preHandler: [authenticate] }, async (request, reply) => {
-    if (!request.user) {
-      return reply.status(401).send({ error: 'Authentication required.' });
-    }
+    if (!request.user) return reply.status(401).send({ error: 'Authentication required.' });
 
     try {
+      const opts = await getUserExportOptions(request.user.id);
       const userUploads = await db.select({ id: receiptUploads.id }).from(receiptUploads).where(eq(receiptUploads.userId, request.user.id));
 
-      if (userUploads.length === 0) {
-        return reply.status(404).send({ message: 'No uploads found for this user.' });
-      }
+      if (userUploads.length === 0) return reply.status(404).send({ message: 'No uploads found for this user.' });
 
       const uploadIds = userUploads.map(u => u.id);
+      const userReceipts: CsvReceipt[] = await db.query.receipts.findMany({ where: inArray(receipts.uploadId, uploadIds), with: { lineItems: true } });
 
-      const userReceipts: Receipt[] = await db.query.receipts.findMany({
-        where: inArray(receipts.uploadId, uploadIds),
-        with: {
-          lineItems: true,
-        },
-      });
+      if (!userReceipts?.length) return reply.status(404).send({ message: 'No receipts found for this user.' });
 
-      if (!userReceipts || userReceipts.length === 0) {
-        return reply.status(404).send({ message: 'No receipts found for this user.' });
-      }
-
-      const csv = generateItemsCsv(userReceipts);
-
-      if (!csv) {
-        return reply.status(404).send({ message: 'No line items found for this user.' });
-      }
+      const csv = generateItemsCsv(userReceipts, opts);
+      if (!csv) return reply.status(404).send({ message: 'No line items found for this user.' });
 
       reply.header('Content-Type', 'text/csv');
       reply.header('Content-Disposition', `attachment; filename="items_export.csv"`);
       reply.send(csv);
-
     } catch (error) {
-      request.log.error({ err: error as any }, 'Failed to export user items to CSV');
+      request.log.error({ err: error }, 'Failed to export user items to CSV');
       reply.status(500).send({ error: 'Could not export items to CSV.', details: error });
     }
   });
@@ -518,14 +505,15 @@ export default async function userRoutes(server: FastifyInstance) {
         };
       });
 
-      const csv = generateUploadsCsv(uploads);
+      const opts = await getUserExportOptions(request.user.id);
+      const csv = generateUploadsCsv(uploads, opts);
 
       reply.header('Content-Type', 'text/csv');
       reply.header('Content-Disposition', `attachment; filename="uploads_export.csv"`);
       reply.send(csv);
 
     } catch (error) {
-      request.log.error({ err: error as any }, 'Failed to export user uploads to CSV');
+      request.log.error({ err: error }, 'Failed to export user uploads to CSV');
       reply.status(500).send({ error: 'Could not export uploads to CSV.', details: error });
     }
   });
@@ -574,5 +562,56 @@ export default async function userRoutes(server: FastifyInstance) {
     }
 
     return reply.send({ deletedCount, message: `Cleaned up ${deletedCount} original file(s).` });
+  });
+
+  // GET current user settings
+  server.get('/users/me/settings', { preHandler: [authenticate] }, async (request, reply) => {
+    if (!request.user) return reply.status(401).send({ error: 'User not authenticated.' });
+
+    const [user] = await db
+      .select({ autoResumeRateLimited: users.autoResumeRateLimited, exportSettings: users.exportSettings })
+      .from(users)
+      .where(eq(users.id, request.user.id));
+
+    if (!user) return reply.status(404).send({ error: 'User not found.' });
+
+    return reply.send({
+      autoResumeRateLimited: user.autoResumeRateLimited,
+      exportSettings: { ...DEFAULT_EXPORT_OPTIONS, ...(user.exportSettings ?? {}) },
+    });
+  });
+
+  // PATCH user settings
+  server.patch('/users/me/settings', { preHandler: [authenticate] }, async (request, reply) => {
+    if (!request.user) return reply.status(401).send({ error: 'User not authenticated.' });
+
+    const body = request.body as { autoResumeRateLimited?: boolean; exportSettings?: Partial<ExportOptions> };
+    const updateSet: Record<string, unknown> = {};
+
+    if (typeof body.autoResumeRateLimited === 'boolean') {
+      updateSet.autoResumeRateLimited = body.autoResumeRateLimited;
+    }
+
+    if (body.exportSettings && typeof body.exportSettings === 'object') {
+      // Read current settings and merge
+      const [current] = await db.select({ exportSettings: users.exportSettings }).from(users).where(eq(users.id, request.user.id));
+      updateSet.exportSettings = { ...DEFAULT_EXPORT_OPTIONS, ...(current?.exportSettings ?? {}), ...body.exportSettings };
+    }
+
+    if (Object.keys(updateSet).length === 0) {
+      return reply.status(400).send({ error: 'Invalid settings payload.' });
+    }
+
+    await db.update(users).set(updateSet).where(eq(users.id, request.user.id));
+
+    const [updated] = await db
+      .select({ autoResumeRateLimited: users.autoResumeRateLimited, exportSettings: users.exportSettings })
+      .from(users)
+      .where(eq(users.id, request.user.id));
+
+    return reply.send({
+      autoResumeRateLimited: updated.autoResumeRateLimited,
+      exportSettings: { ...DEFAULT_EXPORT_OPTIONS, ...(updated.exportSettings ?? {}) },
+    });
   });
 }
