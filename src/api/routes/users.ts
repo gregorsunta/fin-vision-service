@@ -417,7 +417,10 @@ export default async function userRoutes(server: FastifyInstance) {
       if (userUploads.length === 0) return reply.status(404).send({ message: 'No receipt uploads found for this user.' });
 
       const uploadIds = userUploads.map(u => u.id);
-      const userReceipts: CsvReceipt[] = await db.query.receipts.findMany({ where: inArray(receipts.uploadId, uploadIds) });
+      const userReceipts: CsvReceipt[] = await db.query.receipts.findMany({
+        where: inArray(receipts.uploadId, uploadIds),
+        with: { lineItems: true },
+      });
 
       if (!userReceipts?.length) return reply.status(404).send({ message: 'No processed receipts found for this user.' });
 

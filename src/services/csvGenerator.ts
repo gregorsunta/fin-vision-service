@@ -26,6 +26,7 @@ export interface CsvLineItem {
   pricePerUnit: string | null;
   totalPrice: string;
   keywords: unknown;
+  deletedAt?: Date | string | null;
 }
 
 export interface CsvReceipt {
@@ -39,6 +40,7 @@ export interface CsvReceipt {
   status: string;
   reviewStatus: string | null;
   keywords: unknown;
+  itemsNonReadable?: boolean;
   lineItems?: CsvLineItem[];
 }
 
@@ -141,7 +143,7 @@ export function generateItemsCsv(receipts: CsvReceipt[], opts: ExportOptions = D
 }
 
 /**
- * One row per receipt, no line items.
+ * One row per receipt. Includes item count and top-5 most expensive items as context columns.
  */
 export function generateReceiptsCsv(receipts: CsvReceipt[], opts: ExportOptions = DEFAULT_EXPORT_OPTIONS): string {
   if (!receipts.length) return '';
@@ -151,11 +153,30 @@ export function generateReceiptsCsv(receipts: CsvReceipt[], opts: ExportOptions 
     'Receipt ID', 'Upload ID', 'Store Name', 'Total Amount', 'Tax Amount',
     ...(opts.includeCurrency ? ['Currency'] : []),
     'Transaction Date', 'Status', 'Review Status', 'Keywords',
+    'Item Count', 'Top 5 Items',
   ];
 
   const rows: string[] = opts.includeHeader ? [headers.join(s)] : [];
 
   for (const receipt of receipts) {
+    let itemCount: string;
+    let top5Items: string;
+
+    if (receipt.itemsNonReadable) {
+      itemCount = 'N/A';
+      top5Items = 'N/A';
+    } else {
+      const activeItems = (receipt.lineItems ?? []).filter(item => !item.deletedAt);
+      itemCount = String(activeItems.length);
+      const top5 = [...activeItems]
+        .filter(item => item.totalPrice && !isNaN(parseFloat(item.totalPrice)))
+        .sort((a, b) => parseFloat(b.totalPrice) - parseFloat(a.totalPrice))
+        .slice(0, 5);
+      top5Items = top5
+        .map(item => `${item.description}(${formatAmount(item.totalPrice, opts)}${receipt.currency ?? ''})`)
+        .join(' | ');
+    }
+
     const cols = [
       receipt.id,
       receipt.uploadId,
@@ -167,6 +188,8 @@ export function generateReceiptsCsv(receipts: CsvReceipt[], opts: ExportOptions 
       quote(receipt.status),
       quote(receipt.reviewStatus ?? 'not_required'),
       quote(formatKeywords(receipt.keywords)),
+      quote(itemCount),
+      quote(top5Items),
     ];
     rows.push(cols.join(s));
   }
