@@ -138,6 +138,7 @@ const receiptProcessorWorker = new Worker<ReceiptJobData>(
         if (rateLimitedReached) {
           await db.update(receipts).set({ status: 'rate_limited' }).where(eq(receipts.id, receiptRecordId));
           await db.insert(processingErrors).values({
+            uploadType: 'receipt',
             uploadId,
             receiptId: receiptRecordId,
             category: 'SYSTEM_ERROR',
@@ -188,6 +189,7 @@ const receiptProcessorWorker = new Worker<ReceiptJobData>(
             rateLimitedReached = true;
             await db.update(receipts).set({ status: 'rate_limited' }).where(eq(receipts.id, receiptRecordId));
             await db.insert(processingErrors).values({
+              uploadType: 'receipt',
               uploadId,
               receiptId: receiptRecordId,
               category: 'SYSTEM_ERROR',
@@ -201,6 +203,7 @@ const receiptProcessorWorker = new Worker<ReceiptJobData>(
           } else {
             await db.update(receipts).set({ status: 'failed' }).where(eq(receipts.id, receiptRecordId));
             await db.insert(processingErrors).values({
+              uploadType: 'receipt',
               uploadId,
               receiptId: receiptRecordId,
               category: 'EXTRACTION_FAILURE',
@@ -222,6 +225,7 @@ const receiptProcessorWorker = new Worker<ReceiptJobData>(
       log.error({ err, jobId: job.id, uploadId }, 'job failed critically');
       await db.update(receiptUploads).set({ status: 'failed' }).where(eq(receiptUploads.id, uploadId));
       await db.insert(processingErrors).values({
+        uploadType: 'receipt',
         uploadId,
         category: 'SYSTEM_ERROR',
         message: errorMessage,

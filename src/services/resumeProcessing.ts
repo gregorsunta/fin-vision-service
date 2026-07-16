@@ -1,4 +1,4 @@
-import { eq, inArray } from 'drizzle-orm';
+import { and, eq, inArray } from 'drizzle-orm';
 import path from 'path';
 import { db } from '../db/index.js';
 import { receiptUploads, receipts, processingErrors, users } from '../db/schema.js';
@@ -20,7 +20,7 @@ export async function resumeRateLimitedReceipts(uploadId: number): Promise<numbe
   const errorsForUpload = await db
     .select()
     .from(processingErrors)
-    .where(eq(processingErrors.uploadId, uploadId));
+    .where(and(eq(processingErrors.uploadType, 'receipt'), eq(processingErrors.uploadId, uploadId)));
 
   const rateLimitedReceiptIds = new Set(
     errorsForUpload
@@ -87,10 +87,13 @@ export async function resumeRateLimitedReceipts(uploadId: number): Promise<numbe
 export async function autoResumeEligibleUploads(): Promise<void> {
   const now = new Date();
 
-  // Find all partly_completed uploads that have rate-limited receipts
+  // Find all partly_completed uploads that have rate-limited receipts.
+  // Scoped to 'receipt' — processing_errors also holds bank-statement rows
+  // with the same errorType, and uploadId alone isn't unique across domains.
   const rateLimitErrors = await db
     .select()
-    .from(processingErrors);
+    .from(processingErrors)
+    .where(eq(processingErrors.uploadType, 'receipt'));
 
   // Group by uploadId, find latest resetTime per upload
   const uploadResetTimes = new Map<number, Date>();

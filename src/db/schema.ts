@@ -67,6 +67,12 @@ export const receiptUploads = mysqlTable('receipt_uploads', {
 
 export const processingErrors = mysqlTable('processing_errors', {
   id: serial('id').primaryKey(),
+  // uploadId alone is NOT a safe join key — receipt_uploads and
+  // bank_statement_uploads each have their own independent auto-increment
+  // sequence, so the same numeric id gets reused across both domains.
+  // uploadType disambiguates which table uploadId actually points into;
+  // every query against this table MUST filter on both columns together.
+  uploadType: mysqlEnum('upload_type', ['receipt', 'bank_statement']).notNull().default('receipt'),
   uploadId: int('upload_id').notNull(),
   receiptId: int('receipt_id'), // Can be null if the error is for the whole upload
   category: mysqlEnum('category', ['IMAGE_QUALITY', 'EXTRACTION_FAILURE', 'SYSTEM_ERROR', 'VALIDATION_WARNING']).notNull(),
@@ -74,7 +80,7 @@ export const processingErrors = mysqlTable('processing_errors', {
   metadata: json('metadata'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 }, (table) => ({
-  uploadIdIdx: index('idx_processing_errors_upload_id').on(table.uploadId),
+  uploadIdIdx: index('idx_processing_errors_upload_id').on(table.uploadType, table.uploadId),
 }));
 
 // Duplicate detection matches table
@@ -213,7 +219,13 @@ export const lineItems = mysqlTable('line_items', {
 
 export const receiptEditHistory = mysqlTable('receipt_edit_history', {
   id: serial('id').primaryKey(),
-  entityType: mysqlEnum('entity_type', ['receipt', 'line_item']).notNull(),
+  entityType: mysqlEnum('entity_type', [
+    'receipt',
+    'line_item',
+    'bank_account',
+    'bank_statement_upload',
+    'bank_transaction',
+  ]).notNull(),
   entityId: int('entity_id').notNull(),
   fieldName: varchar('field_name', { length: 100 }).notNull(),
   oldValue: text('old_value'),
@@ -224,9 +236,160 @@ export const receiptEditHistory = mysqlTable('receipt_edit_history', {
   entityIdx: index('idx_entity').on(table.entityType, table.entityId, table.fieldName, table.changedAt),
 }));
 
+// --- Bank statements feature ---
+
+// User-owned bank accounts. Created manually by user or auto-created when a statement
+// contains an unrecognized IBAN. Canonical key is (userId, iban).
+export const bankAccounts = mysqlTable('bank_accounts', {
+  id: serial('id').primaryKey(),
+  userId: int('user_id').notNull(),
+  iban: varchar('iban', { length: 34 }).notNull(),
+  accountName: varchar('account_name', { length: 255 }),
+  bankName: varchar('bank_name', { length: 255 }),
+  currency: varchar('currency', { length: 3 }).default('EUR').notNull(),
+  isAutoCreated: boolean('is_auto_created').default(false).notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().onUpdateNow().notNull(),
+  deletedAt: timestamp('deleted_at'),
+}, (table) => ({
+  uqUserIban: uniqueIndex('uq_bank_accounts_user_iban').on(table.userId, table.iban),
+  userIdIdx: index('idx_bank_accounts_user_id').on(table.userId),
+}));
+
+// One uploaded statement file. May cover one or more months. Each file produces
+// many bank_transactions rows.
+export const bankStatementUploads = mysqlTable('bank_statement_uploads', {
+  id: serial('id').primaryKey(),
+  userId: int('user_id').notNull(),
+  // Null until IBAN is recognized or user assigns an account manually.
+  bankAccountId: int('bank_account_id'),
+  uploadNumber: int('upload_number').notNull(),
+  originalFileName: varchar('original_file_name', { length: 255 }),
+  fileUrl: varchar('file_url', { length: 2048 }).notNull(),
+  // Original, uncompressed file before any processing; null once cleaned up.
+  rawFileUrl: varchar('raw_file_url', { length: 2048 }),
+  fileHash: varchar('file_hash', { length: 64 }),
+  mimeType: varchar('mime_type', { length: 100 }).notNull(),
+  periodStart: datetime('period_start'),
+  periodEnd: datetime('period_end'),
+  openingBalance: decimal('opening_balance', { precision: 15, scale: 4 }),
+  closingBalance: decimal('closing_balance', { precision: 15, scale: 4 }),
+  totalDebit: decimal('total_debit', { precision: 15, scale: 4 }),
+  totalCredit: decimal('total_credit', { precision: 15, scale: 4 }),
+  status: mysqlEnum('status', [
+    'processing',
+    'pending_user_review',
+    'completed',
+    'partly_completed',
+    'failed',
+    'duplicate',
+    'needs_account_selection',
+  ]).default('processing').notNull(),
+  parsingMetadata: json('parsing_metadata').$type<{
+    parser: 'native-pdf' | 'pdfplumber' | 'csv' | 'xlsx' | 'ocr-ai' | 'local-rules';
+    parserVersion?: string;
+    detectedIban?: string;
+    detectedBankName?: string;
+    transactionCount: number;
+    warnings?: Array<{ code: string; message: string; row?: number }>;
+    processedAt: string;
+    durationMs?: number;
+  }>(),
+  splitMetadata: json('split_metadata'),
+  // GDPR review-gate fields. See workers/bankStatement* and routes/bank-statements/review.ts.
+  // The redacted text is stored ONLY between Phase 1 (parse + redact) and Phase 2 (AI send).
+  // It is shown to the user for explicit confirmation before any external API call. Cleared
+  // after Phase 2 completes (or after TTL / cancel).
+  redactedText: text('redacted_text'),
+  redactionStats: json('redaction_stats').$type<{
+    emails: number;
+    phones: number;
+    ibans: number;
+    addresses: number;
+    taxIds: number;
+    persons: number;
+  }>(),
+  // Locally-detected IBAN, kept so Phase 2 can re-run redactPII with the same primary IBAN.
+  detectedIban: varchar('detected_iban', { length: 34 }),
+  userConfirmedAt: timestamp('user_confirmed_at'),
+  userConfirmedFromIp: varchar('user_confirmed_from_ip', { length: 45 }),
+  pendingReviewExpiresAt: timestamp('pending_review_expires_at'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().onUpdateNow().notNull(),
+  deletedAt: timestamp('deleted_at'),
+}, (table) => ({
+  uqUserUploadNumber: uniqueIndex('uq_bank_statement_upload_number').on(table.userId, table.uploadNumber),
+  userIdIdx: index('idx_bank_statement_uploads_user_id').on(table.userId),
+  bankAccountIdIdx: index('idx_bank_statement_uploads_bank_account_id').on(table.bankAccountId),
+  statusIdx: index('idx_bank_statement_uploads_status').on(table.status),
+}));
+
+// Individual transactions extracted from a bank_statement_upload.
+// userId and bankAccountId are denormalized for efficient period/account queries
+// on the unified analysis page (avoids always joining through uploads).
+export const bankTransactions = mysqlTable('bank_transactions', {
+  id: serial('id').primaryKey(),
+  statementUploadId: int('statement_upload_id').notNull(),
+  bankAccountId: int('bank_account_id').notNull(),
+  userId: int('user_id').notNull(),
+  transactionDate: datetime('transaction_date').notNull(),
+  valueDate: datetime('value_date'),
+  // GDPR whitelist: counterparty names, counterparty IBANs and payment refs
+  // (sklic) are intentionally not persisted. The `description` field is kept
+  // but PII-redacted at parse time (see services/bank-statement/pii-filter.ts).
+  description: text('description'),
+  debit: decimal('debit', { precision: 15, scale: 4 }),
+  credit: decimal('credit', { precision: 15, scale: 4 }),
+  runningBalance: decimal('running_balance', { precision: 15, scale: 4 }),
+  currency: varchar('currency', { length: 3 }).notNull(),
+  category: varchar('category', { length: 50 }),
+  isDuplicate: boolean('is_duplicate').default(false).notNull(),
+  duplicateOfTransactionId: int('duplicate_of_transaction_id'),
+  duplicateConfidenceScore: decimal('duplicate_confidence_score', { precision: 5, scale: 2 }),
+  duplicateOverride: boolean('duplicate_override').default(false).notNull(),
+  confidenceScores: json('confidence_scores').$type<{
+    date: number;
+    amount: number;
+    description: number;
+  }>(),
+  editedAt: timestamp('edited_at'),
+  deletedAt: timestamp('deleted_at'),
+}, (table) => ({
+  statementUploadIdIdx: index('idx_bank_transactions_statement_upload_id').on(table.statementUploadId),
+  userIdDateIdx: index('idx_bank_transactions_user_date').on(table.userId, table.transactionDate),
+  bankAccountIdDateIdx: index('idx_bank_transactions_account_date').on(table.bankAccountId, table.transactionDate),
+}));
+
+// Confidence-scored match between a bank transaction and a receipt. A single
+// transaction typically has at most one confirmed match, but the table allows
+// several pending candidates until the user picks one.
+export const transactionReceiptMatches = mysqlTable('transaction_receipt_matches', {
+  id: serial('id').primaryKey(),
+  transactionId: int('transaction_id').notNull(),
+  receiptId: int('receipt_id').notNull(),
+  confidenceScore: decimal('confidence_score', { precision: 5, scale: 2 }).notNull(),
+  matchFactors: json('match_factors').$type<{
+    amount: { score: number; difference: number };
+    date: { score: number; daysDifference: number };
+    description: { score: number; overlap: number };
+  }>(),
+  userAction: mysqlEnum('user_action', ['pending', 'confirmed', 'rejected'])
+    .default('pending')
+    .notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().onUpdateNow().notNull(),
+}, (table) => ({
+  transactionIdIdx: index('idx_transaction_receipt_matches_transaction_id').on(table.transactionId),
+  receiptIdIdx: index('idx_transaction_receipt_matches_receipt_id').on(table.receiptId),
+  uqTxReceipt: uniqueIndex('uq_transaction_receipt_matches_tx_receipt').on(table.transactionId, table.receiptId),
+}));
+
 // --- Relations ---
 export const usersRelations = relations(users, ({ many }) => ({
   receiptUploads: many(receiptUploads),
+  bankAccounts: many(bankAccounts),
+  bankStatementUploads: many(bankStatementUploads),
+  bankTransactions: many(bankTransactions),
 }));
 
 export const receiptUploadsRelations = relations(receiptUploads, ({ one, many }) => ({
@@ -281,6 +444,59 @@ export const duplicateMatchesRelations = relations(duplicateMatches, ({ one }) =
   }),
   potentialDuplicate: one(receipts, {
     fields: [duplicateMatches.potentialDuplicateId],
+    references: [receipts.id],
+  }),
+}));
+
+export const bankAccountsRelations = relations(bankAccounts, ({ one, many }) => ({
+  user: one(users, {
+    fields: [bankAccounts.userId],
+    references: [users.id],
+  }),
+  statementUploads: many(bankStatementUploads),
+  transactions: many(bankTransactions),
+}));
+
+export const bankStatementUploadsRelations = relations(bankStatementUploads, ({ one, many }) => ({
+  user: one(users, {
+    fields: [bankStatementUploads.userId],
+    references: [users.id],
+  }),
+  bankAccount: one(bankAccounts, {
+    fields: [bankStatementUploads.bankAccountId],
+    references: [bankAccounts.id],
+  }),
+  transactions: many(bankTransactions),
+}));
+
+export const bankTransactionsRelations = relations(bankTransactions, ({ one, many }) => ({
+  statementUpload: one(bankStatementUploads, {
+    fields: [bankTransactions.statementUploadId],
+    references: [bankStatementUploads.id],
+  }),
+  bankAccount: one(bankAccounts, {
+    fields: [bankTransactions.bankAccountId],
+    references: [bankAccounts.id],
+  }),
+  user: one(users, {
+    fields: [bankTransactions.userId],
+    references: [users.id],
+  }),
+  duplicateOf: one(bankTransactions, {
+    fields: [bankTransactions.duplicateOfTransactionId],
+    references: [bankTransactions.id],
+    relationName: 'txDuplicate',
+  }),
+  receiptMatches: many(transactionReceiptMatches),
+}));
+
+export const transactionReceiptMatchesRelations = relations(transactionReceiptMatches, ({ one }) => ({
+  transaction: one(bankTransactions, {
+    fields: [transactionReceiptMatches.transactionId],
+    references: [bankTransactions.id],
+  }),
+  receipt: one(receipts, {
+    fields: [transactionReceiptMatches.receiptId],
     references: [receipts.id],
   }),
 }));

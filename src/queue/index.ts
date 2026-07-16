@@ -27,3 +27,36 @@ export interface ReceiptJobData {
   receiptId?: number;
   receiptImagePath?: string;
 }
+
+export const bankStatementProcessingQueue = new Queue('bank-statement-processing', {
+  connection,
+  defaultJobOptions: {
+    attempts: 3,
+    backoff: {
+      type: 'exponential',
+      delay: 30000,
+    },
+  },
+});
+
+export interface BankStatementJobData {
+  uploadId: number;
+  filePath: string;
+  mimeType: string;
+  originalFileName?: string;
+}
+
+// Phase 2 queue. Only the explicit user-confirm endpoint is allowed to enqueue here.
+// The Phase 1 worker has no producer reference to this queue, by design — that is one of
+// the seven layers of the GDPR review gate. See workers/bankStatementAiSendProcessor.ts.
+export const bankStatementAiSendQueue = new Queue('bank-statement-ai-send', {
+  connection,
+  defaultJobOptions: {
+    attempts: 3,
+    backoff: { type: 'exponential', delay: 30000 },
+  },
+});
+
+export interface BankStatementAiSendJobData {
+  uploadId: number;
+}

@@ -1,7 +1,7 @@
 import { randomBytes } from 'crypto';
 import { FastifyInstance } from 'fastify';
 import { db, users, receiptUploads, receipts, lineItems, processingErrors, duplicateMatches } from '../../db/index.js';
-import { eq, inArray, desc, asc, sql, count, or } from 'drizzle-orm';
+import { and, eq, inArray, desc, asc, sql, count, or } from 'drizzle-orm';
 import { authenticate } from '../auth.js';
 import fs from 'fs/promises';
 import { deleteFile } from '../../utils/file-utils.js';
@@ -361,7 +361,9 @@ export default async function userRoutes(server: FastifyInstance) {
       }
 
       if (uploadIds.length > 0) {
-        const errorsResult = await db.delete(processingErrors).where(inArray(processingErrors.uploadId, uploadIds));
+        const errorsResult = await db
+          .delete(processingErrors)
+          .where(and(eq(processingErrors.uploadType, 'receipt'), inArray(processingErrors.uploadId, uploadIds)));
         deletedCounts.errors = errorsResult[0].affectedRows || 0;
 
         const receiptsResult = await db.delete(receipts).where(inArray(receipts.uploadId, uploadIds));

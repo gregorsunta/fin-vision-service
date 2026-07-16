@@ -83,7 +83,7 @@ export default async function retrieveRoutes(server: FastifyInstance) {
     const errors = await db
       .select()
       .from(processingErrors)
-      .where(eq(processingErrors.uploadId, uploadIdNum));
+      .where(and(eq(processingErrors.uploadType, 'receipt'), eq(processingErrors.uploadId, uploadIdNum)));
 
     const duplicateSourceMap = await resolveDuplicateSources(receiptsList);
 

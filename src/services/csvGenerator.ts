@@ -197,6 +197,175 @@ export function generateReceiptsCsv(receipts: CsvReceipt[], opts: ExportOptions 
   return rows.join('\n') + '\n';
 }
 
+// --- Bank statement exports ---
+
+export interface CsvBankTransaction {
+  id: number;
+  statementUploadId: number;
+  bankAccountId: number;
+  bankAccountIban?: string | null;
+  bankAccountName?: string | null;
+  transactionDate: Date | string | null;
+  valueDate?: Date | string | null;
+  description: string | null;
+  debit: string | null;
+  credit: string | null;
+  runningBalance?: string | null;
+  currency: string | null;
+  category?: string | null;
+  isDuplicate?: boolean | null;
+}
+
+export interface CsvBankStatementUpload {
+  id: number;
+  uploadNumber: number;
+  bankAccountIban?: string | null;
+  bankAccountName?: string | null;
+  originalFileName: string | null;
+  periodStart: Date | string | null;
+  periodEnd: Date | string | null;
+  openingBalance: string | null;
+  closingBalance: string | null;
+  totalDebit: string | null;
+  totalCredit: string | null;
+  status: string;
+  createdAt: Date | string;
+}
+
+/**
+ * One row per bank transaction. Includes the parent statement upload id and
+ * the resolved bank-account label so the CSV is self-contained.
+ */
+export function generateBankTransactionsCsv(
+  transactions: CsvBankTransaction[],
+  opts: ExportOptions = DEFAULT_EXPORT_OPTIONS,
+): string {
+  if (!transactions.length) return '';
+
+  const s = sep(opts);
+  const headers = [
+    'Transaction ID', 'Statement Upload ID', 'Bank Account', 'IBAN',
+    'Date', 'Value Date', 'Description',
+    'Debit', 'Credit', 'Running Balance',
+    ...(opts.includeCurrency ? ['Currency'] : []),
+    'Category', 'Duplicate',
+  ];
+
+  const rows: string[] = opts.includeHeader ? [headers.join(s)] : [];
+
+  for (const t of transactions) {
+    const cols = [
+      t.id,
+      t.statementUploadId,
+      quote(t.bankAccountName ?? ''),
+      quote(t.bankAccountIban ?? ''),
+      quote(formatDate(t.transactionDate, opts)),
+      quote(formatDate(t.valueDate ?? null, opts)),
+      quote(t.description),
+      formatAmount(t.debit, opts),
+      formatAmount(t.credit, opts),
+      formatAmount(t.runningBalance ?? null, opts),
+      ...(opts.includeCurrency ? [quote(t.currency)] : []),
+      quote(t.category ?? ''),
+      quote(t.isDuplicate ? 'yes' : ''),
+    ];
+    rows.push(cols.join(s));
+  }
+  return rows.join('\n') + '\n';
+}
+
+export function generateBankStatementUploadsCsv(
+  uploads: CsvBankStatementUpload[],
+  opts: ExportOptions = DEFAULT_EXPORT_OPTIONS,
+): string {
+  if (!uploads.length) return '';
+  const s = sep(opts);
+  const headers = [
+    'Upload ID', 'Upload Number', 'Bank Account', 'IBAN',
+    'Original File', 'Period Start', 'Period End',
+    'Opening Balance', 'Closing Balance', 'Total Debit', 'Total Credit',
+    'Status', 'Created At',
+  ];
+  const rows: string[] = opts.includeHeader ? [headers.join(s)] : [];
+  for (const u of uploads) {
+    rows.push([
+      u.id,
+      u.uploadNumber,
+      quote(u.bankAccountName ?? ''),
+      quote(u.bankAccountIban ?? ''),
+      quote(u.originalFileName),
+      quote(formatDate(u.periodStart, opts)),
+      quote(formatDate(u.periodEnd, opts)),
+      formatAmount(u.openingBalance, opts),
+      formatAmount(u.closingBalance, opts),
+      formatAmount(u.totalDebit, opts),
+      formatAmount(u.totalCredit, opts),
+      quote(u.status),
+      quote(formatDate(u.createdAt, opts)),
+    ].join(s));
+  }
+  return rows.join('\n') + '\n';
+}
+
+export type UnifiedSource = 'matched' | 'bank_statement_only' | 'receipt_only';
+
+export interface CsvUnifiedRow {
+  source: UnifiedSource;
+  matchConfidence: number | null;
+  date: Date | string | null;
+  amount: string | null;
+  currency: string | null;
+  // Bank-side
+  transactionId: number | null;
+  description: string | null;
+  bankAccount: string | null;
+  bankAccountIban: string | null;
+  // Receipt-side
+  receiptId: number | null;
+  storeName: string | null;
+  receiptNumber: string | null;
+  // Admin
+  notes?: string;
+}
+
+/**
+ * Combined export: one row per match (or per orphan transaction / orphan
+ * receipt). The `source` column lets the user filter for missing-receipt rows
+ * in their accounting tool of choice.
+ */
+export function generateUnifiedCsv(
+  rows: CsvUnifiedRow[],
+  opts: ExportOptions = DEFAULT_EXPORT_OPTIONS,
+): string {
+  if (!rows.length) return '';
+  const s = sep(opts);
+  const headers = [
+    'Source', 'Match Confidence', 'Date', 'Amount',
+    ...(opts.includeCurrency ? ['Currency'] : []),
+    'Transaction ID', 'Description', 'Bank Account', 'Bank IBAN',
+    'Receipt ID', 'Store Name', 'Receipt #', 'Notes',
+  ];
+  const out: string[] = opts.includeHeader ? [headers.join(s)] : [];
+  for (const r of rows) {
+    out.push([
+      quote(r.source),
+      r.matchConfidence == null ? '' : r.matchConfidence.toFixed(2),
+      quote(formatDate(r.date, opts)),
+      formatAmount(r.amount, opts),
+      ...(opts.includeCurrency ? [quote(r.currency)] : []),
+      r.transactionId ?? '',
+      quote(r.description),
+      quote(r.bankAccount ?? ''),
+      quote(r.bankAccountIban ?? ''),
+      r.receiptId ?? '',
+      quote(r.storeName),
+      quote(r.receiptNumber ?? ''),
+      quote(r.notes ?? ''),
+    ].join(s));
+  }
+  return out.join('\n') + '\n';
+}
+
 /**
  * One row per upload with aggregate statistics.
  */

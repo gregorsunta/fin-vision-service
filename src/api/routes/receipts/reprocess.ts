@@ -1,6 +1,6 @@
 import { FastifyInstance } from 'fastify';
 import path from 'path';
-import { eq, or } from 'drizzle-orm';
+import { and, eq, or } from 'drizzle-orm';
 import { authenticate } from '../../auth.js';
 import { db } from '../../../db/index.js';
 import { duplicateMatches, lineItems, processingErrors, receiptUploads, receipts } from '../../../db/schema.js';
@@ -64,7 +64,7 @@ export default async function reprocessRoutes(server: FastifyInstance) {
       const existingErrors = await db
         .select()
         .from(processingErrors)
-        .where(eq(processingErrors.uploadId, uploadIdNum));
+        .where(and(eq(processingErrors.uploadType, 'receipt'), eq(processingErrors.uploadId, uploadIdNum)));
       for (const error of existingErrors) {
         if (error.receiptId === receiptIdNum) {
           await db.delete(processingErrors).where(eq(processingErrors.id, error.id));
@@ -234,7 +234,9 @@ export default async function reprocessRoutes(server: FastifyInstance) {
     }
 
     await db.delete(receipts).where(eq(receipts.uploadId, uploadIdNum));
-    await db.delete(processingErrors).where(eq(processingErrors.uploadId, uploadIdNum));
+    await db
+      .delete(processingErrors)
+      .where(and(eq(processingErrors.uploadType, 'receipt'), eq(processingErrors.uploadId, uploadIdNum)));
 
     if (upload.markedImageUrl) {
       await deleteFile(upload.markedImageUrl);

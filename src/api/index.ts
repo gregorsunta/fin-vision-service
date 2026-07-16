@@ -7,7 +7,11 @@ import userRoutes from './routes/users.js';
 import fileRoutes from './routes/files.js';
 import imageProcessingRoutes from './routes/image-processing.js';
 import receiptEditingRoutes from './routes/receipt-editing.js';
+import bankAccountRoutes from './routes/bank-accounts.js';
+import bankStatementsRoutes from './routes/bank-statements/index.js';
+import analysisRoutes from './routes/analysis.js';
 import { autoResumeEligibleUploads } from '../services/resumeProcessing.js';
+import { expirePendingReviews } from '../services/bank-statement/review-ttl.js';
 import { getConfig } from '../config/index.js';
 import { createLogger, getRootLogger } from '../utils/logger.js';
 import { registerErrorHandler } from './middleware/error-handler.js';
@@ -48,6 +52,9 @@ async function main() {
   server.register(fileRoutes, { prefix: '/api' });
   server.register(imageProcessingRoutes, { prefix: '/api' });
   server.register(receiptEditingRoutes, { prefix: '/api' });
+  server.register(bankAccountRoutes, { prefix: '/api' });
+  server.register(bankStatementsRoutes, { prefix: '/api' });
+  server.register(analysisRoutes, { prefix: '/api' });
 
   // ── Start ─────────────────────────────────────────────────────────────────
   const port = getConfig().API_PORT;
@@ -64,10 +71,22 @@ async function main() {
     }
   }, 60_000);
 
+  // Review TTL sweeper: every hour, expire pending_user_review uploads past
+  // their TTL and clear the stored redacted text.
+  const reviewTtlInterval = setInterval(async () => {
+    try {
+      const { expired } = await expirePendingReviews();
+      if (expired > 0) log.info({ expired }, 'expired pending review uploads');
+    } catch (err) {
+      log.error({ err }, 'review TTL sweeper error');
+    }
+  }, 60 * 60 * 1000);
+
   // ── Graceful shutdown ─────────────────────────────────────────────────────
   const shutdown = async (signal: string) => {
     log.info({ signal }, 'shutdown signal received');
     clearInterval(resumeInterval);
+    clearInterval(reviewTtlInterval);
     try {
       await server.close();
       log.info('API server closed');

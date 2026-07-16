@@ -1,5 +1,5 @@
 import { FastifyInstance } from 'fastify';
-import { eq, or } from 'drizzle-orm';
+import { and, eq, or } from 'drizzle-orm';
 import { authenticate } from '../../auth.js';
 import { db } from '../../../db/index.js';
 import { duplicateMatches, lineItems, processingErrors, receiptUploads, receipts } from '../../../db/schema.js';
@@ -51,7 +51,9 @@ export default async function deleteRoutes(server: FastifyInstance) {
     }
 
     await db.delete(receipts).where(eq(receipts.uploadId, uploadIdNum));
-    await db.delete(processingErrors).where(eq(processingErrors.uploadId, uploadIdNum));
+    await db
+      .delete(processingErrors)
+      .where(and(eq(processingErrors.uploadType, 'receipt'), eq(processingErrors.uploadId, uploadIdNum)));
 
     if (upload.rawImageUrl) {
       await deleteFile(upload.rawImageUrl);

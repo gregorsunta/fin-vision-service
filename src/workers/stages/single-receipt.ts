@@ -57,6 +57,7 @@ export async function processSingleReceipt(
         );
         await db.update(receipts).set({ status: 'unreadable' }).where(eq(receipts.id, receiptId));
         await db.insert(processingErrors).values({
+          uploadType: 'receipt',
           uploadId,
           receiptId,
           category: 'EXTRACTION_FAILURE',
@@ -94,6 +95,7 @@ export async function processSingleReceipt(
       if (rateLimitErr) {
         await db.update(receipts).set({ status: 'rate_limited' }).where(eq(receipts.id, receiptId));
         await db.insert(processingErrors).values({
+          uploadType: 'receipt',
           uploadId,
           receiptId,
           category: 'SYSTEM_ERROR',
@@ -107,6 +109,7 @@ export async function processSingleReceipt(
       } else {
         await db.update(receipts).set({ status: 'failed' }).where(eq(receipts.id, receiptId));
         await db.insert(processingErrors).values({
+          uploadType: 'receipt',
           uploadId,
           receiptId,
           category: 'EXTRACTION_FAILURE',

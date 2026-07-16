@@ -57,6 +57,19 @@ services:
       # Allow up to 60 s for the model to load on cold start.
       start_period: 60s
 
+  pii-detector:
+    build: ./pii-detector-service
+    restart: unless-stopped
+    ports:
+      - "${PII_DETECTOR_PORT:-8002}:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8000/health\")'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # Allow up to 30 s for spaCy model load on cold start.
+      start_period: 30s
+
 volumes:
   mysql-data:
   redis-data:

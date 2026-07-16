@@ -133,6 +133,7 @@ export async function saveExtractedData(
   if (extractedData.validationIssues && extractedData.validationIssues.length > 0) {
     for (const issue of extractedData.validationIssues) {
       await dbConn.insert(processingErrors).values({
+        uploadType: 'receipt',
         uploadId,
         receiptId,
         category: 'VALIDATION_WARNING',
